@@ -52,6 +52,8 @@ async def lifespan(app: FastAPI):
         strategy=strategy,
         retriever=retriever,
     )
+    # from api.dependencies import set_query_service
+    # set_query_service(_query_service)
 
     print(f"[startup] LLM={s.LLM_PROVIDER} | DB={s.DB_TYPE} | STRATEGY={s.STRATEGY}")
     yield

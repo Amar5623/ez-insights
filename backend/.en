@@ -1,0 +1,56 @@
+# ─────────────────────────────────────────────────────────────
+# Copy this file to .env and fill in your values.
+# NEVER commit .env to git.
+# ─────────────────────────────────────────────────────────────
+
+# ── LLM provider ─────────────────────────────────────────────
+# Options: openai | gemini | ollama
+LLM_PROVIDER=openai
+
+OPENAI_API_KEY=sk-...
+OPENAI_MODEL=gpt-4o-mini
+
+GEMINI_API_KEY=
+GEMINI_MODEL=gemini-1.5-flash
+
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=llama3
+
+# ── Embedder provider ─────────────────────────────────────────
+# Options: openai | cohere
+EMBEDDER_PROVIDER=openai
+OPENAI_EMBEDDING_MODEL=text-embedding-3-small
+
+COHERE_API_KEY=
+
+# ── Database ──────────────────────────────────────────────────
+# Options: mysql | mongo
+DB_TYPE=mysql
+
+MYSQL_HOST=localhost
+MYSQL_PORT=3306
+MYSQL_USER=root
+MYSQL_PASSWORD=
+MYSQL_DATABASE=nlsql_db
+
+MONGO_URI=mongodb://localhost:27017
+MONGO_DATABASE=nlsql_db
+
+# ── Vector store ──────────────────────────────────────────────
+# Options: faiss | pinecone
+VECTOR_STORE=faiss
+FAISS_INDEX_PATH=./data/faiss_index
+
+PINECONE_API_KEY=
+PINECONE_INDEX=nlsql
+
+# ── Strategy ──────────────────────────────────────────────────
+# Options: auto | sql | fuzzy | vector | combined
+# auto = router decides based on question type
+STRATEGY=auto
+MAX_RETRIES=3
+MAX_RESULT_ROWS=20
+
+# ── API ───────────────────────────────────────────────────────
+API_KEY=change-me-before-deploy
+CORS_ORIGINS=["http://localhost:5173"]
