@@ -1,12 +1,13 @@
 from contextlib import contextmanager
 from typing import Generator
-import PyMySQL
+import pymysql                          # lowercase — same fix as mysql_adapter
+from dbutils.pooled_db import PooledDB  # DBUtils already in requirements.txt
 from core.config.settings import get_settings
 
 
 class MySQLConnectionPool:
     """
-    Simple connection pool for MySQL using DBUtils or a manual implementation.
+    Simple connection pool for MySQL using DBUtils.
     Dev 1 owns this file.
 
     Usage:
@@ -17,27 +18,43 @@ class MySQLConnectionPool:
     """
 
     def __init__(self, pool_size: int = 5):
-        # TODO (Dev 1): initialise pool
-        # Option A — manual list of connections
-        # Option B — use dbutils: pip install DBUtils
-        #   from dbutils.pooled_db import PooledDB
-        #   self._pool = PooledDB(PyMySQL, pool_size, **config)
+        s = get_settings()
+
+        # config dict — same fields as MySQLAdapter
+        self._config = {
+            "host":     s.MYSQL_HOST,
+            "port":     s.MYSQL_PORT,
+            "user":     s.MYSQL_USER,
+            "password": s.MYSQL_PASSWORD,
+            "database": s.MYSQL_DATABASE,
+            "cursorclass": pymysql.cursors.DictCursor,
+            "autocommit": True,
+        }
+
         self._pool_size = pool_size
-        self._pool = None
-        raise NotImplementedError("Initialise the pool in __init__")
+
+        # create the pool — DBUtils manages all connections inside
+        self._pool = PooledDB(
+            creator=pymysql,        # which library to use
+            maxconnections=pool_size,  # max connections allowed at once
+            mincached=2,            # keep at least 2 connections ready at all times
+            maxcached=pool_size,    # max idle connections to keep in pool
+            blocking=True,          # if pool is full — wait, don't crash
+            **self._config          # unpack all connection settings
+        )
 
     @contextmanager
     def get_connection(self) -> Generator:
         """
-        Context manager — yields a live connection, returns it to the pool on exit.
+        Context manager — borrows a connection from pool, returns it on exit.
 
         with pool.get_connection() as conn:
-            ...
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM books")
+        # connection automatically returned to pool here
         """
-        # TODO (Dev 1):
-        # conn = self._pool.connection()
-        # try:
-        #     yield conn
-        # finally:
-        #     conn.close()   # returns to pool, not actually closed
-        raise NotImplementedError
+        conn = self._pool.connection()  # borrow a connection from pool
+        try:
+            yield conn                  # hand it to whoever called this
+        finally:
+            conn.close()               # return it to pool — NOT actually closed
