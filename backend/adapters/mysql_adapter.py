@@ -1,5 +1,5 @@
 from typing import Any
-import PyMySQL
+import pymysql   
 from core.interfaces import BaseDBAdapter
 from core.config.settings import get_settings
 
@@ -21,35 +21,59 @@ class MySQLAdapter(BaseDBAdapter):
             "user": s.MYSQL_USER,
             "password": s.MYSQL_PASSWORD,
             "database": s.MYSQL_DATABASE,
-            "cursorclass": PyMySQL.cursors.DictCursor,
+            "cursorclass": pymysql.cursors.DictCursor,
             "autocommit": True,
         }
 
     def connect(self) -> None:
-        # TODO (Dev 1): open PyMySQL connection using self._config
-        raise NotImplementedError
+     if self._connection is not None:        # idempotent — don't reconnect if already open
+        return
+     try:
+        self._connection = pymysql.connect(**self._config)
+     except pymysql.Error as e:
+        raise ConnectionError(
+            f"MySQL connection failed — host={self._config['host']} "
+            f"port={self._config['port']} — {e}"
+        ) from e
 
     def disconnect(self) -> None:
-        # TODO (Dev 1): close self._connection safely
-        raise NotImplementedError
+     if self._connection is None:    # must not raise if connect() was never called
+        return
+     try:
+        self._connection.close()
+     finally:
+        self._connection = None     # always reset to None even if close() fails
 
     def execute_query(self, query: str | dict, params: Any = None) -> list[dict]:
-        # TODO (Dev 1):
-        # - ensure connected
-        # - create cursor, execute query with params
-        # - fetchall() and return as list[dict]
-        # - on error: raise with clear message including query snippet
-        raise NotImplementedError
+        if self._connection is None:
+            raise RuntimeError("Not connected. Call connect() first.")
+        try:
+            with self._connection.cursor() as cursor:
+                cursor.execute(query, params)
+                results = cursor.fetchall()
+                return results if results else []   # NEVER return None
+        except pymysql.err.ProgrammingError as e:
+            raise ValueError(
+                f"Invalid query syntax: {e}\nQuery was: {str(query)[:100]}"
+            ) from e
+        except pymysql.Error as e:
+            raise RuntimeError(
+                f"Query execution failed: {e}\nQuery was: {str(query)[:100]}"
+            ) from e
 
     def fetch_schema(self) -> dict:
-        # TODO (Dev 1): delegate to schema_inspector/mysql.py
+        if self._connection is None:
+            raise RuntimeError("Not connected. Call connect() first.")
         from adapters.schema_inspector.mysql import inspect_mysql_schema
         return inspect_mysql_schema(self._connection)
 
     def health_check(self) -> bool:
-        # TODO (Dev 1): ping the connection, return True/False
-        raise NotImplementedError
-
+       try:
+            with self._connection.cursor() as cursor:
+                cursor.execute("SELECT 1")
+            return True
+       except Exception:
+            return False
     @property
     def db_type(self) -> str:
         return "mysql"

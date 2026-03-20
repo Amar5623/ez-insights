@@ -8,6 +8,7 @@ venv/
 dist/
 build/
 .pytest_cache/
+myenv
 
 # Env files — NEVER commit these
 .env
