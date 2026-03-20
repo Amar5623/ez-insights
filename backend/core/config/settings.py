@@ -30,22 +30,24 @@ class Settings(BaseSettings):
 
     # Google Gemini — free tier at https://aistudio.google.com
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL: str = "gemini-1.5-flash"   # 1500 req/day free
+    GEMINI_MODEL: str = "gemini-1.5-flash"
 
     # Ollama (local) — no key, install from https://ollama.com
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "llama3"
 
     # ── Embedder ─────────────────────────────────────────────────────────────
-    # NOTE: OpenAI is kept for EMBEDDINGS ONLY — separate from the LLM choice.
-    # You can freely combine: GROQ for generation + OPENAI for embeddings.
-    EMBEDDER_PROVIDER: str = "openai"     # openai | cohere
+    # Converts schema text and questions into vectors for RAG similarity search.
+    # nomic runs locally through Ollama — same server as the LLM, no extra setup.
+    EMBEDDER_PROVIDER: str = "nomic"      # nomic | cohere
 
-    OPENAI_API_KEY: str = ""              # used only for embeddings, NOT for LLM
-    OPENAI_EMBEDDING_MODEL: str = "text-embedding-3-small"   # 1536 dims
+    # nomic-embed-text (default) — local via Ollama, free, 768 dims
+    # Pull with: ollama pull nomic-embed-text
+    NOMIC_MODEL: str = "nomic-embed-text"
 
+    # Cohere (cloud alternative) — needs API key, 1024 dims
     COHERE_API_KEY: str = ""
-    COHERE_EMBEDDING_MODEL: str = "embed-english-v3.0"       # 1024 dims
+    COHERE_EMBEDDING_MODEL: str = "embed-english-v3.0"
 
     # ── Database ─────────────────────────────────────────────────────────────
     DB_TYPE: str = "mysql"                # mysql | mongo

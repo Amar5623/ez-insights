@@ -11,8 +11,7 @@ google-generativeai==0.5.4    # Gemini LLM
 requests==2.32.2              # Ollama HTTP calls
 
 # Embedders
-# NOTE: openai package is kept here for embeddings only (not used as LLM)
-openai==1.30.1                # OpenAI embeddings via text-embedding-3-small
+# nomic-embed-text runs via Ollama (uses requests above — no extra package)
 cohere==5.5.0                 # Cohere embeddings (alternative)
 
 # Databases
