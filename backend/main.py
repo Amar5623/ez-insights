@@ -44,7 +44,7 @@ async def lifespan(app: FastAPI):
     retriever = SchemaRetriever(adapter, embedder, vector_store, top_k=5)
     retriever.index_schema()   # embed schema once at startup
 
-    strategy = create_strategy(adapter)
+    strategy = create_strategy(adapter, embedder=embedder, vector_store=vector_store)
 
     _query_service = QueryService(
         llm=llm,
@@ -52,8 +52,8 @@ async def lifespan(app: FastAPI):
         strategy=strategy,
         retriever=retriever,
     )
-    # from api.dependencies import set_query_service
-    # set_query_service(_query_service)
+    from api.dependencies import set_query_service
+    set_query_service(_query_service)
 
     print(f"[startup] LLM={s.LLM_PROVIDER} | DB={s.DB_TYPE} | STRATEGY={s.STRATEGY}")
     yield

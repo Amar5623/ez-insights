@@ -1,18 +1,18 @@
-from core.interfaces import BaseStrategy, BaseDBAdapter
+from core.interfaces import BaseStrategy, BaseDBAdapter, BaseEmbedder, BaseVectorStore
 from core.config.settings import get_settings
 
 
-def create_strategy(adapter: BaseDBAdapter, strategy_override: str = None) -> BaseStrategy:
-    """
-    Returns the correct strategy based on STRATEGY in .env.
-    Pass strategy_override to force a specific one at runtime.
-    To add a new strategy: implement BaseStrategy, add a case here.
-    """
+def create_strategy(
+    adapter: BaseDBAdapter,
+    embedder: BaseEmbedder = None,
+    vector_store: BaseVectorStore = None,
+    strategy_override: str = None,
+) -> BaseStrategy:
     name = (strategy_override or get_settings().STRATEGY).lower()
 
     if name == "auto":
         from strategies.router import StrategyRouter
-        return StrategyRouter(adapter)
+        return StrategyRouter(adapter, embedder=embedder, vector_store=vector_store)
 
     if name == "sql":
         from strategies.sql_filter import SQLFilterStrategy
@@ -24,11 +24,11 @@ def create_strategy(adapter: BaseDBAdapter, strategy_override: str = None) -> Ba
 
     if name == "vector":
         from strategies.vector_search import VectorSearchStrategy
-        return VectorSearchStrategy(adapter)
+        return VectorSearchStrategy(adapter, vector_store=vector_store, embedder=embedder)
 
     if name == "combined":
         from strategies.combined import CombinedStrategy
-        return CombinedStrategy(adapter)
+        return CombinedStrategy(adapter, embedder=embedder, vector_store=vector_store)
 
     raise ValueError(
         f"Unknown STRATEGY='{name}'. "
