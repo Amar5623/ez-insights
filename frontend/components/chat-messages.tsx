@@ -4,7 +4,6 @@ import { useEffect, useRef } from 'react'
 import { useChat } from '@/lib/chat-context'
 import type { ChatMessage } from '@/lib/types'
 import { cn } from '@/lib/utils'
-import { ScrollArea } from '@/components/ui/scroll-area'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
@@ -12,6 +11,7 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
+import * as ScrollAreaPrimitive from '@radix-ui/react-scroll-area'
 import {
   UserIcon,
   BotIcon,
@@ -49,7 +49,7 @@ function MessageBubble({ message, index }: { message: ChatMessage; index: number
   }
 
   return (
-    <div 
+    <div
       className={cn(
         'flex gap-3 animate-fade-in-up',
         isUser && 'flex-row-reverse'
@@ -59,8 +59,8 @@ function MessageBubble({ message, index }: { message: ChatMessage; index: number
       <div
         className={cn(
           'flex h-9 w-9 shrink-0 items-center justify-center rounded-xl transition-transform duration-300 hover:scale-105',
-          isUser 
-            ? 'bg-primary shadow-md shadow-primary/25' 
+          isUser
+            ? 'bg-primary shadow-md shadow-primary/25'
             : 'bg-gradient-to-br from-primary/20 to-primary/10 ring-2 ring-primary/20'
         )}
       >
@@ -161,8 +161,8 @@ function MessageBubble({ message, index }: { message: ChatMessage; index: number
 
         {/* Strategy Badge */}
         {message.strategy_used && (
-          <Badge 
-            variant="secondary" 
+          <Badge
+            variant="secondary"
             className="text-xs gap-1 animate-scale-in animation-delay-200"
           >
             <ZapIcon className="h-3 w-3" />
@@ -182,14 +182,22 @@ function MessageBubble({ message, index }: { message: ChatMessage; index: number
 }
 
 export function ChatMessages() {
-  const { currentChat, isLoading } = useChat()
-  const scrollRef = useRef<HTMLDivElement>(null)
-  const bottomRef = useRef<HTMLDivElement>(null)
+  const { currentChat, isLoading, sendMessage } = useChat()
+  // FIX: Direct ref to the Radix ScrollArea Viewport so we can imperatively
+  // set scrollTop — avoids the scrollIntoView-on-wrong-ancestor bug.
+  const viewportRef = useRef<HTMLDivElement>(null)
 
   // Auto-scroll to bottom when new messages arrive
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    if (!viewportRef.current) return
+    viewportRef.current.scrollTop = viewportRef.current.scrollHeight
   }, [currentChat?.messages])
+
+  const SUGGESTION_CHIPS = [
+    'Show all customers',
+    'Total sales last month',
+    'Top 10 products',
+  ]
 
   if (isLoading) {
     return (
@@ -219,12 +227,13 @@ export function ChatMessages() {
             them into SQL queries and show you the results instantly.
           </p>
           <div className="mt-8 flex flex-wrap justify-center gap-2">
-            {['Show all customers', 'Total sales last month', 'Top 10 products'].map((text, i) => (
-              <Badge 
+            {SUGGESTION_CHIPS.map((text, i) => (
+              <Badge
                 key={text}
-                variant="outline" 
+                variant="outline"
                 className="cursor-pointer px-4 py-2 text-sm transition-all duration-300 hover:bg-primary hover:text-primary-foreground hover:border-primary hover:scale-105 animate-fade-in"
                 style={{ animationDelay: `${(i + 1) * 100}ms` }}
+                onClick={() => sendMessage(text)}
               >
                 {text}
               </Badge>
@@ -236,13 +245,23 @@ export function ChatMessages() {
   }
 
   return (
-    <ScrollArea className="flex-1 theme-transition" ref={scrollRef}>
-      <div className="mx-auto max-w-3xl space-y-6 p-6 pb-8">
-        {currentChat.messages.map((message, index) => (
-          <MessageBubble key={message.id} message={message} index={index} />
-        ))}
-        <div ref={bottomRef} />
-      </div>
-    </ScrollArea>
+    // FIX: Use ScrollAreaPrimitive directly so we can attach a ref to the
+    // Viewport element. This is the actual scrollable div — setting
+    // scrollTop on it reliably scrolls the message list to the bottom.
+    <ScrollAreaPrimitive.Root className="flex-1 overflow-hidden theme-transition">
+      <ScrollAreaPrimitive.Viewport
+        ref={viewportRef}
+        className="h-full w-full"
+      >
+        <div className="mx-auto max-w-3xl space-y-6 p-6 pb-8">
+          {currentChat.messages.map((message, index) => (
+            <MessageBubble key={message.id} message={message} index={index} />
+          ))}
+        </div>
+      </ScrollAreaPrimitive.Viewport>
+      <ScrollAreaPrimitive.Scrollbar orientation="vertical" className="flex touch-none select-none transition-colors h-full w-2.5 border-l border-l-transparent p-[1px]">
+        <ScrollAreaPrimitive.Thumb className="relative flex-1 rounded-full bg-border" />
+      </ScrollAreaPrimitive.Scrollbar>
+    </ScrollAreaPrimitive.Root>
   )
 }
