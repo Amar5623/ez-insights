@@ -5,7 +5,8 @@ from datetime import datetime
 
 class QueryRequest(BaseModel):
     question: str
-    db_type: str | None = None   # overrides .env DB_TYPE if provided
+    db_type: str | None = None
+    context: list[dict] | None = []
 
 
 class QueryResponse(BaseModel):
