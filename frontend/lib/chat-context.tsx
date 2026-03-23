@@ -26,13 +26,11 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const [isLoading, setIsLoading] = useState(true)
   const [isSending, setIsSending] = useState(false)
 
-  // Load chats from localStorage on mount
   useEffect(() => {
     const stored = localStorage.getItem(STORAGE_KEY)
     if (stored) {
       try {
         const parsed = JSON.parse(stored) as Chat[]
-        // Convert date strings back to Date objects
         const restored = parsed.map(chat => ({
           ...chat,
           created_at: new Date(chat.created_at),
@@ -53,7 +51,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     setIsLoading(false)
   }, [])
 
-  // Save chats to localStorage whenever they change
   useEffect(() => {
     if (!isLoading) {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(chats))
@@ -70,11 +67,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       created_at: new Date(),
       updated_at: new Date(),
     }
-    
-    setChats(prev => {
-      const updated = [newChat, ...prev].slice(0, MAX_RECENT_CHATS)
-      return updated
-    })
+    setChats(prev => [newChat, ...prev].slice(0, MAX_RECENT_CHATS))
     setCurrentChatId(newChat.id)
   }, [])
 
@@ -85,7 +78,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const deleteChat = useCallback((chatId: string) => {
     setChats(prev => {
       const filtered = prev.filter(c => c.id !== chatId)
-      // If we deleted the current chat, switch to another or clear
       if (currentChatId === chatId) {
         setCurrentChatId(filtered.length > 0 ? filtered[0].id : null)
       }
@@ -98,7 +90,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
     let chatId = currentChatId
 
-    // Create new chat if none exists
     if (!chatId) {
       const newChat: Chat = {
         id: crypto.randomUUID(),
@@ -127,13 +118,14 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       isLoading: true,
     }
 
-    // Add user message and loading state immediately
     setChats(prev => prev.map(chat => {
       if (chat.id === chatId) {
         const isFirstMessage = chat.messages.length === 0
         return {
           ...chat,
-          title: isFirstMessage ? content.slice(0, 30) + (content.length > 30 ? '...' : '') : chat.title,
+          title: isFirstMessage
+            ? content.slice(0, 30) + (content.length > 30 ? '...' : '')
+            : chat.title,
           messages: [...chat.messages, userMessage, loadingMessage],
           updated_at: new Date(),
         }
@@ -144,7 +136,21 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     setIsSending(true)
 
     try {
-      const response = await sendQuery({ question: content })
+      const currentMessages = chats.find(c => c.id === chatId)?.messages ?? []
+
+      const context = currentMessages
+        .filter(m => !m.isLoading && m.role === 'assistant' && m.sql)
+        .slice(-5)
+        .map(m => ({
+          question: m.content,
+          sql: m.sql ?? '',
+          answer: m.content,
+        }))
+
+      const response = await sendQuery({
+        question: content,
+        context,
+      })
 
       const assistantMessage: ChatMessage = {
         id: loadingMessage.id,
@@ -157,12 +163,11 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         timestamp: new Date(),
       }
 
-      // Replace loading message with actual response
       setChats(prev => prev.map(chat => {
         if (chat.id === chatId) {
           return {
             ...chat,
-            messages: chat.messages.map(msg => 
+            messages: chat.messages.map(msg =>
               msg.id === loadingMessage.id ? assistantMessage : msg
             ),
             updated_at: new Date(),
@@ -174,16 +179,17 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       const errorMessage: ChatMessage = {
         id: loadingMessage.id,
         role: 'assistant',
-        content: error instanceof Error ? error.message : 'An error occurred while processing your query.',
+        content: error instanceof Error
+          ? error.message
+          : 'An error occurred while processing your query.',
         timestamp: new Date(),
       }
 
-      // Replace loading message with error
       setChats(prev => prev.map(chat => {
         if (chat.id === chatId) {
           return {
             ...chat,
-            messages: chat.messages.map(msg => 
+            messages: chat.messages.map(msg =>
               msg.id === loadingMessage.id ? errorMessage : msg
             ),
             updated_at: new Date(),
@@ -194,7 +200,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     } finally {
       setIsSending(false)
     }
-  }, [currentChatId, isSending])
+  }, [currentChatId, isSending, chats])
 
   return (
     <ChatContext.Provider value={{
