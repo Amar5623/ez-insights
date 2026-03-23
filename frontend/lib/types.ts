@@ -3,6 +3,7 @@
 export interface QueryRequest {
   question: string
   db_type?: string | null
+  context?: Array<{ question: string; sql: string; answer: string }>
 }
 
 export interface QueryResponse {
