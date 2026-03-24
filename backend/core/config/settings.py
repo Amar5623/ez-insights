@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     # ── Embedder ─────────────────────────────────────────────────────────────
     # Converts schema text and questions into vectors for RAG similarity search.
     # nomic runs locally through Ollama — same server as the LLM, no extra setup.
-    EMBEDDER_PROVIDER: str = "nomic"      # nomic | cohere
+    EMBEDDER_PROVIDER: str = "nomic"      # nomic | cohere | gemma
 
     # nomic-embed-text (default) — local via Ollama, free, 768 dims
     # Pull with: ollama pull nomic-embed-text
@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     # Cohere (cloud alternative) — needs API key, 1024 dims
     COHERE_API_KEY: str = ""
     COHERE_EMBEDDING_MODEL: str = "embed-english-v3.0"
+
+    # EmbeddingGemma 300M — local via HuggingFace sentence-transformers, 768 dims
+    # Requires: pip install sentence-transformers
+    # Requires: accept license at huggingface.co/google/embeddinggemma-300m
+    HF_TOKEN: str = ""   # HuggingFace token for gated model download
 
     # ── Database ─────────────────────────────────────────────────────────────
     DB_TYPE: str = "mysql"                # mysql | mongo
@@ -74,7 +79,37 @@ class Settings(BaseSettings):
     # ── Query strategy ───────────────────────────────────────────────────────
     STRATEGY: str = "auto"               # auto | sql | fuzzy | vector | combined
     MAX_RETRIES: int = 3
-    MAX_RESULT_ROWS: int = 100
+
+    # ── Row limits — three separate concerns ─────────────────────────────────
+    #
+    # These three settings serve completely different purposes and must NOT
+    # be conflated. Changing one should never affect the others.
+    #
+    # MAX_DB_FETCH_ROWS: hard cap on rows the DB query returns.
+    #   Applied as a Python slice after strategy.execute() — acts as a safety
+    #   net so a rogue query never returns 100k rows into memory.
+    #   Strategies also use this in their own LIMIT clauses.
+    #
+    # MAX_ROWS_FOR_LLM: how many rows are injected into the answer-generation
+    #   prompt sent to the LLM. Must be much smaller than MAX_DB_FETCH_ROWS —
+    #   100 rows of raw data in a prompt is 5000–8000 tokens; the LLM cannot
+    #   reason well over that volume and it is expensive.
+    #   The full result set is still returned to the frontend.
+    #
+    # PAGE_SIZE: UI-level setting — how many rows the frontend shows per page
+    #   before the "Show more" button. Backend never uses this directly;
+    #   it is exposed here so it can be changed without a frontend redeploy.
+    #   (Frontend reads it from the QueryResponse or uses the constant directly.)
+    #
+    MAX_DB_FETCH_ROWS: int = 100   # rows fetched from DB (was MAX_RESULT_ROWS)
+    MAX_ROWS_FOR_LLM: int = 15     # rows sent to LLM answer-generation prompt
+    PAGE_SIZE: int = 10            # rows shown per page in the UI
+
+    # Backward-compat alias — Dev 2's strategy files reference MAX_RESULT_ROWS.
+    # Do NOT remove until all strategy files are updated to MAX_DB_FETCH_ROWS.
+    @property
+    def MAX_RESULT_ROWS(self) -> int:
+        return self.MAX_DB_FETCH_ROWS
 
     # ── API / server ─────────────────────────────────────────────────────────
     API_KEY: str = "change-me-in-env"
