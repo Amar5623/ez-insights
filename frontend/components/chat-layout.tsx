@@ -15,7 +15,7 @@ export function ChatLayout() {
 
       {/* Main Chat Area */}
       <main className="flex flex-1 flex-col overflow-hidden">
-        <ChatMessages />
+        <ChatMessages sidebarOpen={sidebarOpen} />
         <ChatInput />
       </main>
     </div>
