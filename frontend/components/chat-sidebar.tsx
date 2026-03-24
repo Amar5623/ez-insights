@@ -127,7 +127,7 @@ export function ChatSidebar({ isOpen, onToggle }: ChatSidebarProps) {
                             <MessageSquareIcon className="h-3.5 w-3.5" />
                           </div>
                           <span className={cn(
-                            'truncate text-sm transition-colors duration-200',
+                            'truncate text-sm transition-colors duration-200 max-w-[140px]',
                             currentChat?.id === chat.id
                               ? 'text-sidebar-foreground font-medium'
                               : 'text-sidebar-foreground/80'
@@ -190,19 +190,20 @@ export function ChatSidebar({ isOpen, onToggle }: ChatSidebarProps) {
 
       {/* Expand button — floats on the edge when sidebar is collapsed */}
       {!isOpen && (
-        <div className="flex flex-col items-center justify-start pt-4 pr-1 animate-fade-in">
+        <div className="flex flex-col items-center justify-start pt-4 animate-fade-in">
           <button
             onClick={onToggle}
             className={cn(
-              'group flex h-9 w-9 items-center justify-center rounded-xl',
-              'bg-sidebar border border-sidebar-border shadow-md',
+              'group relative flex h-8 w-5 items-center justify-center',
+              'bg-sidebar border-y border-r border-sidebar-border shadow-md',
+              'rounded-r-md',
               'text-muted-foreground transition-all duration-200',
               'hover:bg-primary hover:text-primary-foreground hover:border-primary',
-              'hover:shadow-lg hover:shadow-primary/25 hover:scale-105 active:scale-95'
+              'hover:shadow-lg hover:shadow-primary/25 hover:w-6 active:scale-95'
             )}
             title="Open sidebar"
           >
-            <ChevronRightIcon className="h-4 w-4 transition-transform duration-200 group-hover:translate-x-0.5" />
+            <ChevronRightIcon className="h-3.5 w-3.5 transition-transform duration-200 group-hover:translate-x-0.5" />
           </button>
         </div>
       )}

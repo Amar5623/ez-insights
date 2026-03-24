@@ -181,7 +181,7 @@ function MessageBubble({ message, index }: { message: ChatMessage; index: number
   )
 }
 
-export function ChatMessages() {
+export function ChatMessages({ sidebarOpen }: { sidebarOpen: boolean }) {
   const { currentChat, isLoading, sendMessage } = useChat()
   // FIX: Direct ref to the Radix ScrollArea Viewport so we can imperatively
   // set scrollTop — avoids the scrollIntoView-on-wrong-ancestor bug.
@@ -212,47 +212,52 @@ export function ChatMessages() {
     )
   }
 
-  if (!currentChat || currentChat.messages.length === 0) {
-    return (
-      <div className="flex flex-1 items-center justify-center p-8">
-        <div className="max-w-md text-center animate-fade-in-up">
-          <div className="mx-auto mb-6 flex h-20 w-20 items-center justify-center rounded-3xl bg-gradient-to-br from-primary/20 to-primary/5 ring-4 ring-primary/10 shadow-lg shadow-primary/10">
-            <BotIcon className="h-10 w-10 text-primary" />
-          </div>
-          <h2 className="mb-3 text-2xl font-semibold text-foreground">
-            Welcome to Ez-Insights
-          </h2>
-          <p className="text-muted-foreground leading-relaxed">
-            Ask questions about your database in plain English. I'll translate
-            them into SQL queries and show you the results instantly.
-          </p>
-          <div className="mt-8 flex flex-wrap justify-center gap-2">
-            {SUGGESTION_CHIPS.map((text, i) => (
-              <Badge
-                key={text}
-                variant="outline"
-                className="cursor-pointer px-4 py-2 text-sm transition-all duration-300 hover:bg-primary hover:text-primary-foreground hover:border-primary hover:scale-105 animate-fade-in"
-                style={{ animationDelay: `${(i + 1) * 100}ms` }}
-                onClick={() => sendMessage(text)}
-              >
-                {text}
-              </Badge>
-            ))}
-          </div>
+if (!currentChat || currentChat.messages.length === 0) {
+  return (
+    <div className="flex flex-1 items-center justify-center p-8">
+      <div className="max-w-md text-center animate-fade-in-up">
+        <div className="mx-auto mb-6 flex h-20 w-20 items-center justify-center rounded-3xl bg-gradient-to-br from-primary/20 to-primary/5 ring-4 ring-primary/10 shadow-lg shadow-primary/10">
+          <BotIcon className="h-10 w-10 text-primary" />
+        </div>
+        <h2 className="mb-3 text-2xl font-semibold text-foreground">
+          Welcome to Ez-Insights
+        </h2>
+        <p className="text-muted-foreground leading-relaxed">
+          Ask questions about your database in plain English. I'll translate
+          them into SQL queries and show you the results instantly.
+        </p>
+        <div className="mt-8 flex flex-wrap justify-center gap-2">
+          {SUGGESTION_CHIPS.map((text, i) => (
+            <Badge
+              key={text}
+              variant="outline"
+              className="cursor-pointer px-4 py-2 text-sm transition-all duration-300 hover:bg-primary hover:text-primary-foreground hover:border-primary hover:scale-105 animate-fade-in"
+              style={{ animationDelay: `${(i + 1) * 100}ms` }}
+              onClick={() => sendMessage(text)}
+            >
+              {text}
+            </Badge>
+          ))}
         </div>
       </div>
-    )
-  }
+    </div>
+  )
+}
 
-  return (
-    // FIX: Use ScrollAreaPrimitive directly so we can attach a ref to the
-    // Viewport element. This is the actual scrollable div — setting
-    // scrollTop on it reliably scrolls the message list to the bottom.
+// Has messages — logo + name stay at top, description + chips are gone
+return (
+  <div className="flex flex-1 flex-col overflow-hidden">
+    {/* Sticky header — logo + name only */}{!sidebarOpen && (
+    <div className="flex items-center gap-3 border-b border-border px-6 py-3 bg-background/80 backdrop-blur-sm animate-fade-in">
+      <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-gradient-to-br from-primary/20 to-primary/5 ring-2 ring-primary/10">
+        <BotIcon className="h-4 w-4 text-primary" />
+      </div>
+      <span className="font-semibold text-foreground">Ez-Insights</span>
+    </div>)}
+
+    {/* Messages */}
     <ScrollAreaPrimitive.Root className="flex-1 overflow-hidden theme-transition">
-      <ScrollAreaPrimitive.Viewport
-        ref={viewportRef}
-        className="h-full w-full"
-      >
+      <ScrollAreaPrimitive.Viewport ref={viewportRef} className="h-full w-full">
         <div className="mx-auto max-w-3xl space-y-6 p-6 pb-8">
           {currentChat.messages.map((message, index) => (
             <MessageBubble key={message.id} message={message} index={index} />
@@ -263,5 +268,5 @@ export function ChatMessages() {
         <ScrollAreaPrimitive.Thumb className="relative flex-1 rounded-full bg-border" />
       </ScrollAreaPrimitive.Scrollbar>
     </ScrollAreaPrimitive.Root>
-  )
-}
+  </div>
+)}
