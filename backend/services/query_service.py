@@ -17,6 +17,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+from services.data_scrubber import scrub_rows
 from enum import Enum
 
 from core.interfaces import BaseLLM, BaseDBAdapter, BaseStrategy
@@ -428,10 +429,27 @@ class QueryService:
             try:
                 result = self.strategy.execute(question, generated_query)
 
+                # 🔒 Layer 3 — Response Scrubbing (CRITICAL)
+                from services.data_scrubber import scrub_rows
+
+                original_rows = result.rows
+                scrubbed_rows = scrub_rows(original_rows)
+
+                # Log if any redaction happened
+                if scrubbed_rows != original_rows:
+                    logger.warning(
+                        "[data-masking] Layer 3 triggered: sensitive data was redacted from results"
+                    )
+
+                # Replace results with scrubbed data
+                result.rows = scrubbed_rows
+                result.row_count = len(scrubbed_rows)
+
                 if attempt > 1:
                     logger.info(
                         f"[QueryService] Succeeded on attempt {attempt}/{max_retries}"
                     )
+
                 return result
 
             except Exception as e:

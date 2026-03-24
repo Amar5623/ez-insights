@@ -36,3 +36,7 @@ Thumbs.db
 
 # Logs
 *.log
+
+
+# MYSQL
+backend/db/views.sql
