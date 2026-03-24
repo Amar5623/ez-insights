@@ -15,7 +15,7 @@ The instance is created once at startup in main.py lifespan and reused.
 """
 import logging
 from dataclasses import dataclass, field
-
+from services.data_scrubber import scrub_rows
 from core.interfaces import BaseLLM, BaseDBAdapter, BaseStrategy
 from rag.schema_retriever import SchemaRetriever
 from rag.prompt_builder import PromptBuilder
@@ -251,10 +251,27 @@ class QueryService:
             try:
                 result = self.strategy.execute(question, generated_query)
 
+                # 🔒 Layer 3 — Response Scrubbing (CRITICAL)
+                from services.data_scrubber import scrub_rows
+
+                original_rows = result.rows
+                scrubbed_rows = scrub_rows(original_rows)
+
+                # Log if any redaction happened
+                if scrubbed_rows != original_rows:
+                    logger.warning(
+                        "[data-masking] Layer 3 triggered: sensitive data was redacted from results"
+                    )
+
+                # Replace results with scrubbed data
+                result.rows = scrubbed_rows
+                result.row_count = len(scrubbed_rows)
+
                 if attempt > 1:
                     logger.info(
                         f"[QueryService] Succeeded on attempt {attempt}/{max_retries}"
                     )
+
                 return result
 
             except Exception as e:

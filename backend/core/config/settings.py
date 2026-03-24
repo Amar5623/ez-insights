@@ -34,7 +34,7 @@ class Settings(BaseSettings):
 
     # Ollama (local) — no key, install from https://ollama.com
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    OLLAMA_MODEL: str = "llama3"
+    OLLAMA_MODEL: str = "phi3"
 
     # ── Embedder ─────────────────────────────────────────────────────────────
     # Converts schema text and questions into vectors for RAG similarity search.
@@ -79,6 +79,9 @@ class Settings(BaseSettings):
     # ── API / server ─────────────────────────────────────────────────────────
     API_KEY: str = "change-me-in-env"
     CORS_ORIGINS: list[str] = ["http://localhost:5173"]
+
+    # ── Sensitive Data Masking───────────────────────────────────────────────────────────────
+    SENSITIVE_COLUMNS_EXTRA: list[str] = []
 
     class Config:
         env_file = ".env"
