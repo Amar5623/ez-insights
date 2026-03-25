@@ -117,7 +117,9 @@ class Settings(BaseSettings):
 
     # ── Sensitive Data Masking───────────────────────────────────────────────────────────────
     SENSITIVE_COLUMNS_EXTRA: list[str] = []
-
+    # session
+    APP_MONGO_URI: str = "mongodb+srv://..."   # same cluster, different DB is fine
+    APP_MONGO_DB_NAME: str = "ez_insights_data"
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"

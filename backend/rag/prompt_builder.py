@@ -76,7 +76,7 @@ Rules:
 ANSWER_GENERATION_TEMPLATE = """
 You are a helpful data analyst assistant.
 
-The user asked: {question}
+{context}The user asked: {question}
 
 Query that was executed:
 {sql_query}
@@ -152,6 +152,7 @@ class PromptBuilder:
         row_count: int,
         quality: str = "ok",
         sql_query: str = "",
+        context: list[dict] | None = None,
     ) -> str:
         """
         Build the natural language answer generation prompt.
@@ -163,6 +164,8 @@ class PromptBuilder:
             quality:    Result quality signal from QueryService._assess_result_quality().
                         One of: 'ok' | 'empty' | 'all_null' | 'low_relevance'.
             sql_query:  The actual SQL/Mongo query that was executed.
+            context:    Last N conversation turns for sliding window context.
+                        Each turn: {question, sql, answer}
         """
         from core.config.settings import get_settings
         max_for_llm = get_settings().MAX_ROWS_FOR_LLM
@@ -186,7 +189,19 @@ class PromptBuilder:
             quality, _QUALITY_INSTRUCTIONS["ok"]
         )
 
+        # Build sliding window context block (hard cap at 5 turns)
+        context_text = ""
+        if context:
+            lines = ["Previous conversation turns (for context):"]
+            for i, turn in enumerate(context[-5:], 1):
+                lines.append(f"  Turn {i}:")
+                lines.append(f"    Q: {turn.get('question', '')}")
+                lines.append(f"    SQL: {turn.get('sql', '')}")
+                lines.append(f"    A: {turn.get('answer', '')}")
+            context_text = "\n".join(lines) + "\n\n"
+
         return ANSWER_GENERATION_TEMPLATE.format(
+            context=context_text,
             question=question,
             sql_query=sql_query or "(not available)",
             row_count=row_count,

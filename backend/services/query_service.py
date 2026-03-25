@@ -126,7 +126,7 @@ class QueryService:
 
     # ── Public API ─────────────────────────────────────────────────────────────
 
-    def run(self, question: str) -> QueryResponse:
+    def run(self, question: str, context: list[dict] | None = None) -> QueryResponse:
         """
         Execute the full five-step pipeline for a user question.
 
@@ -196,6 +196,7 @@ class QueryService:
                 row_count=strategy_result.row_count,
                 quality=quality.value,
                 sql_query=strategy_result.query_used,
+                context=context or [],
             )
             answer = self.llm.generate(answer_prompt)
             logger.info(
@@ -429,7 +430,7 @@ class QueryService:
             try:
                 result = self.strategy.execute(question, generated_query)
 
-                # 🔒 Layer 3 — Response Scrubbing (CRITICAL)
+                #  Layer 3 — Response Scrubbing (CRITICAL)
                 from services.data_scrubber import scrub_rows
 
                 original_rows = result.rows

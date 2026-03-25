@@ -3,6 +3,7 @@
 import { useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { useAuth } from '@/lib/auth-context'
+import { setJwtToken } from '@/lib/api'
 import { ChatProvider } from '@/lib/chat-context'
 import { ChatLayout } from '@/components/chat-layout'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -20,7 +21,12 @@ function LoadingScreen() {
 
 export default function HomePage() {
   const router = useRouter()
-  const { user, isLoading } = useAuth()
+  const { user, token, isLoading } = useAuth()
+
+  // Keep api.ts JWT in sync
+  useEffect(() => {
+    setJwtToken(token ?? null)
+  }, [token])
 
   useEffect(() => {
     if (!isLoading && !user) {
@@ -28,13 +34,7 @@ export default function HomePage() {
     }
   }, [user, isLoading, router])
 
-  if (isLoading) {
-    return <LoadingScreen />
-  }
-
-  if (!user) {
-    return <LoadingScreen />
-  }
+  if (isLoading || !user) return <LoadingScreen />
 
   return (
     <ChatProvider>

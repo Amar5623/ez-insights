@@ -14,7 +14,7 @@ from core.factory.strategy_factory import create_strategy
 from core.factory.vector_store_factory import create_vector_store
 from rag.schema_retriever import SchemaRetriever
 from services.query_service import QueryService
-from api.routes import query, history, health
+from api.routes import query, history, health, chats
 from api.middleware.auth import AuthMiddleware
 from api.middleware.logging import LoggingMiddleware
 
@@ -83,3 +83,4 @@ app.add_middleware(
 app.include_router(query.router, prefix="/api")
 app.include_router(history.router, prefix="/api")
 app.include_router(health.router, prefix="/api")
+app.include_router(chats.router, prefix="/api")
