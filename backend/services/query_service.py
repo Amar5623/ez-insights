@@ -48,6 +48,12 @@ from strategies.retry_handler import AttemptRecord
 logger = logging.getLogger("nlsql.query_service")
 
 
+# ─── Custom exception ─────────────────────────────────────────────────────────
+
+class MaxRetriesExceeded(Exception):
+    """Raised when all retry attempts for query generation/execution are exhausted."""
+
+
 # ─── Response dataclass ───────────────────────────────────────────────────────
 
 @dataclass
@@ -125,70 +131,7 @@ class QueryService:
             Never raises — all exceptions are caught and returned as error responses.
         """
         try:
-            # ── Step 1: Schema retrieval ────────────────────────────────────
-            # Find the most relevant tables/collections for this question.
-            # Returns a list of metadata dicts with 'entity' and 'schema_text'.
-            schema_chunks = self.retriever.retrieve(question)
-            logger.debug(
-                f"[QueryService] Retrieved {len(schema_chunks)} schema chunks: "
-                f"{[c.get('entity') for c in schema_chunks]}"
-            )
-
-            # ── Step 2: Build initial prompt ────────────────────────────────
-            # Injects schema context + question into the generation template.
-            initial_prompt = self.prompt_builder.build_query_prompt(
-                question=question,
-                schema_chunks=schema_chunks,
-                attempt_history=None,
-            )
-
-            # ── Steps 3 + 4: Generate query + retry loop ────────────────────
-            # The LLM generates a query. If execution fails, we feed the error
-            # back to the LLM and ask it to correct the query. Repeat up to
-            # MAX_RETRIES times before giving up.
-            strategy_result = self._run_with_retry(
-                question=question,
-                schema_chunks=schema_chunks,
-                initial_prompt=initial_prompt,
-            )
-
-            # ── Step 4b: Assess result quality ──────────────────────────────
-            # Check whether the rows actually answer the question before asking
-            # the LLM to summarise them. The quality signal is passed into the
-            # answer prompt so the LLM responds honestly rather than fabricating
-            # a confident answer from irrelevant or empty data.
-            quality = self._assess_result_quality(question, strategy_result.rows)
-            logger.debug(f"[QueryService] Result quality: {quality.value}")
-
-            # ── Step 5: Generate natural language answer ────────────────────
-            # MAX_ROWS_FOR_LLM (default 15) rows are injected into the prompt —
-            # not the full MAX_DB_FETCH_ROWS (100). The full rows are still
-            # returned to the frontend in QueryResponse.results.
-            answer_prompt = self.prompt_builder.build_answer_prompt(
-                question=question,
-                rows=strategy_result.rows,
-                row_count=strategy_result.row_count,
-                quality=quality.value,
-                sql_query=strategy_result.query_used,
-                context=context or [],
-            )
-            answer = self.llm.generate(answer_prompt)
-            logger.info(
-                f"[QueryService] Success — "
-                f"strategy={strategy_result.strategy_name} | "
-                f"rows={strategy_result.row_count} | "
-                f"quality={quality.value}"
-            )
-
-            return QueryResponse(
-                question=question,
-                sql=strategy_result.query_used,
-                results=strategy_result.rows,
-                row_count=strategy_result.row_count,
-                strategy_used=strategy_result.strategy_name,
-                answer=answer.strip(),
-            )
-
+            return self._run_pipeline(question, context=context)
         except MaxRetriesExceeded as e:
             logger.warning(f"[QueryService] MaxRetriesExceeded: {e}")
             return QueryResponse(
@@ -203,7 +146,7 @@ class QueryService:
                     f"{self._settings.MAX_RETRIES} attempts. "
                     f"Try rephrasing your question. Detail: {e}"
                 ),
-            return self._run_pipeline(question)
+            )
         except Exception as exc:
             logger.error(
                 f"[QueryService] Unhandled error for question={question!r}: {exc}",
@@ -221,7 +164,7 @@ class QueryService:
 
     # ── Private pipeline ──────────────────────────────────────────────────────
 
-    def _run_pipeline(self, question: str) -> QueryResponse:
+    def _run_pipeline(self, question: str, context: list[dict] | None = None) -> QueryResponse:
         """
         Core pipeline — called by run(). Exceptions propagate to run() handler.
         """
@@ -248,6 +191,7 @@ class QueryService:
             row_count=strategy_result.row_count,
             quality=quality,
             sql_query=strategy_result.query_used,
+            context=context or [],
         )
         answer = self.llm.generate(answer_prompt)
 
@@ -279,7 +223,7 @@ class QueryService:
             5. On failure: record the error and retry with updated prompt
 
         Raises:
-            Exception: After MAX_RETRIES failures — re-raises the last exception.
+            MaxRetriesExceeded: After MAX_RETRIES failures.
         """
         attempt_history: list[AttemptRecord] = []
         last_exc: Exception | None = None
@@ -318,7 +262,7 @@ class QueryService:
                     f"[QueryService] Attempt {attempt} parse error: {parse_exc}"
                 )
                 if attempt == self._settings.MAX_RETRIES:
-                    raise
+                    raise MaxRetriesExceeded(str(parse_exc)) from parse_exc
                 continue
 
             # ── Execute strategy ──────────────────────────────────────────────
@@ -329,9 +273,6 @@ class QueryService:
                     f"strategy={result.strategy_name} rows={result.row_count}"
                 )
                 return result
-
-                #  Layer 3 — Response Scrubbing (CRITICAL)
-                from services.data_scrubber import scrub_rows
             except Exception as exc:
                 last_exc = exc
                 attempt_history.append(
@@ -345,10 +286,10 @@ class QueryService:
                     f"[QueryService] Attempt {attempt} execution error: {exc}"
                 )
                 if attempt == self._settings.MAX_RETRIES:
-                    raise
+                    raise MaxRetriesExceeded(str(exc)) from exc
 
         # Should never reach here, but satisfy the type checker
-        raise last_exc  # type: ignore[misc]
+        raise MaxRetriesExceeded(str(last_exc))
 
     # ── Query parsing — the MySQL / MongoDB split ─────────────────────────────
 
