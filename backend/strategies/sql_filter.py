@@ -8,18 +8,42 @@ boolean filters, category matches — for both MySQL and MongoDB.
 How it fits in the system:
     1. QueryService calls strategy.execute(question, generated_query)
     2. generated_query is either a SQL string (MySQL) or a filter dict (MongoDB)
-       — both come from the LLM via PromptBuilder
+       — both come from the LLM via PromptBuilder, parsed by query_service._parse_query
     3. SQLFilterStrategy validates → parameterizes → executes → returns result
 
-Flow:
-    execute()
-        ├── validate query (sql_validator)
-        ├── MySQL  → _execute_mysql(sql)   → parameterize → adapter.execute_query
-        └── Mongo  → _execute_mongo(query) → validate dict → adapter.execute_query
+──────────────────────────────────────────────────────────────────────────────
+MYSQL vs MONGODB — what this strategy does differently
+──────────────────────────────────────────────────────────────────────────────
+
+  MySQL:
+    generated_query is a str  →  "SELECT * FROM products WHERE price > 100 LIMIT 20"
+    _execute_mysql():
+      • Validates with MySQLValidator (blocks DDL, injection, etc.)
+      • Strips trailing semicolon (PyMySQL rejects it)
+      • Parameterizes literals into %s placeholders
+      • Calls adapter.execute_query(sql_string, params_tuple)
+
+  MongoDB:
+    generated_query is a dict → {"collection": "products",
+                                   "filter": {"price": {"$gt": 100}},
+                                   "limit": 20}
+                            or → {"collection": "sales",
+                                   "pipeline": [{...stages...}],
+                                   "limit": 5}
+    _execute_mongo():
+      • Validates with MongoValidator (blocks $where, $set, $out, etc.)
+      • Passes the full dict to adapter.execute_query() unchanged
+      • The adapter internally resolves "filter" vs "pipeline" execution
+      • query_used is formatted as readable JSON for the frontend
+
+  The execute() method reads adapter.db_type and branches to the correct path.
+  MySQL and MongoDB paths share nothing — they are fully independent.
+──────────────────────────────────────────────────────────────────────────────
 """
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -61,8 +85,10 @@ class SQLFilterStrategy(BaseStrategy):
              string/number literals into parameterised placeholders, then
              calls adapter.execute_query(sql, params).
 
-    MongoDB — receives a filter dict from the LLM, validates it for
-              dangerous operators, then calls adapter.execute_query(filter_dict).
+    MongoDB — receives a filter dict (or pipeline dict) from the LLM,
+              validates it for dangerous operators, then calls
+              adapter.execute_query(full_query_dict). The adapter resolves
+              the "filter" vs "pipeline" key internally.
 
     The adapter type is read from self.adapter.db_type at runtime, so the
     same strategy instance works regardless of which DB is configured.
@@ -80,8 +106,8 @@ class SQLFilterStrategy(BaseStrategy):
 
         Args:
             question:        Original natural language question (used for metadata).
-            generated_query: SQL string (MySQL) or filter dict (MongoDB)
-                             produced by the LLM.
+            generated_query: SQL string (MySQL) or query dict (MongoDB)
+                             produced by the LLM and parsed by query_service.
 
         Returns:
             StrategyResult with rows, query_used, strategy_name, row_count.
@@ -92,9 +118,11 @@ class SQLFilterStrategy(BaseStrategy):
         """
         db = self.adapter.db_type.lower()
 
+        # ── MySQL path ────────────────────────────────────────────────────────
         if db == "mysql":
             return self._execute_mysql(question, generated_query)
 
+        # ── MongoDB path ──────────────────────────────────────────────────────
         if db in ("mongo", "mongodb"):
             return self._execute_mongo(question, generated_query)
 
@@ -116,6 +144,7 @@ class SQLFilterStrategy(BaseStrategy):
         - Category/type filters (category, genre, brand)
 
         This is a heuristic hint for the router — it is not a guarantee.
+        Works the same for MySQL and MongoDB (question text is DB-agnostic).
         """
         if not question or not question.strip():
             return False
@@ -130,11 +159,15 @@ class SQLFilterStrategy(BaseStrategy):
     def strategy_name(self) -> str:
         return "sql_filter"
 
-    # ── MySQL execution path ──────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # MYSQL EXECUTION PATH
+    # All methods below this header operate on SQL strings only.
+    # They are never called when DB_TYPE=mongo.
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _execute_mysql(self, question: str, generated_query: Any) -> StrategyResult:
         """
-        Validate → clean → parameterize → execute a MySQL SQL string.
+        MYSQL-SPECIFIC: Validate → clean → parameterize → execute a SQL string.
 
         Steps:
             1. Type-check: must be a string
@@ -148,20 +181,21 @@ class SQLFilterStrategy(BaseStrategy):
         # ── 1. Type check ────────────────────────────────────────────────────
         if not isinstance(generated_query, str):
             raise ValueError(
-                f"MySQL expects a SQL string, got {type(generated_query).__name__}. "
+                f"[MySQL] SQLFilterStrategy expects a SQL string, "
+                f"got {type(generated_query).__name__}. "
                 "Check that the LLM is generating SQL and not a dict."
             )
 
         sql = generated_query.strip()
 
         if not sql:
-            raise ValueError("Generated SQL query is empty.")
+            raise ValueError("[MySQL] Generated SQL query is empty.")
 
         # ── 2. Validate ──────────────────────────────────────────────────────
         validator = get_validator("mysql")
         is_valid, error = validator.validate(sql)
         if not is_valid:
-            raise ValueError(f"Query blocked by validator: {error}")
+            raise ValueError(f"[MySQL] Query blocked by validator: {error}")
 
         # ── 3. Strip trailing semicolon ──────────────────────────────────────
         # PyMySQL raises an error if the query ends with ;
@@ -175,10 +209,10 @@ class SQLFilterStrategy(BaseStrategy):
             rows = self.adapter.execute_query(sql, params)
         except Exception as exc:
             raise RuntimeError(
-                f"SQLFilterStrategy failed to execute query.\n"
-                f"SQL : {sql}\n"
+                f"[MySQL] SQLFilterStrategy failed to execute query.\n"
+                f"SQL   : {sql}\n"
                 f"Params: {params}\n"
-                f"Error: {exc}"
+                f"Error : {exc}"
             ) from exc
 
         # ── 6. Cap rows ──────────────────────────────────────────────────────
@@ -195,8 +229,8 @@ class SQLFilterStrategy(BaseStrategy):
 
     def _parameterize_sql(self, sql: str) -> tuple[str, tuple]:
         """
-        Extract string and number literals from a SQL string into
-        parameterised %s placeholders.
+        MYSQL-SPECIFIC: Extract string and number literals from a SQL string
+        into parameterised %s placeholders.
 
         This is a safety layer on top of the LLM output — even if the LLM
         embeds raw values directly in the SQL, we pull them out so the DB
@@ -258,42 +292,64 @@ class SQLFilterStrategy(BaseStrategy):
 
         return sql, tuple(params)
 
-    # ── MongoDB execution path ────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # MONGODB EXECUTION PATH
+    # All methods below this header operate on query dicts only.
+    # They are never called when DB_TYPE=mysql.
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _execute_mongo(self, question: str, generated_query: Any) -> StrategyResult:
         """
-        Validate → execute a MongoDB filter dict.
+        MONGO-SPECIFIC: Validate → execute a MongoDB query dict.
+
+        The generated_query dict comes fully parsed from query_service._parse_mongo_json.
+        It always has a "collection" key and either a "filter" or "pipeline" key.
+        The adapter resolves which execution path (find vs aggregate) to use.
 
         Steps:
-            1. Type-check: must be a dict or list (pipeline)
+            1. Type-check: must be a dict
             2. Validate with MongoValidator (blocks $where, $set, $out, etc.)
-            3. Execute via adapter
+            3. Execute via adapter — adapter handles filter vs pipeline internally
             4. Cap rows at MAX_RESULT_ROWS
-            5. Return StrategyResult
+            5. Return StrategyResult with JSON-formatted query for display
+
+        Raises:
+            ValueError:   If query is not a dict, missing 'collection', or blocked.
+            RuntimeError: If the adapter fails during execution.
         """
         # ── 1. Type check ────────────────────────────────────────────────────
-        if not isinstance(generated_query, (dict, list)):
+        if not isinstance(generated_query, dict):
             raise ValueError(
-                f"MongoDB expects a filter dict or pipeline list, "
+                f"[MongoDB] SQLFilterStrategy expects a query dict, "
                 f"got {type(generated_query).__name__}. "
-                "Check that the LLM is generating a Mongo filter and not SQL."
+                "Check that query_service._parse_query() correctly parsed "
+                "the LLM JSON output before passing to this strategy."
+            )
+
+        if "collection" not in generated_query:
+            raise ValueError(
+                f"[MongoDB] Query dict missing required 'collection' key.\n"
+                f"Got keys: {list(generated_query.keys())}\n"
+                "The LLM must include 'collection' in its JSON response."
             )
 
         # ── 2. Validate ──────────────────────────────────────────────────────
+        # Validates the entire dict recursively — catches $where, $set, $out, etc.
         validator = get_validator("mongo")
         is_valid, error = validator.validate(generated_query)
         if not is_valid:
-            raise ValueError(f"Query blocked by validator: {error}")
+            raise ValueError(f"[MongoDB] Query blocked by validator: {error}")
 
         # ── 3. Execute ───────────────────────────────────────────────────────
-        # The MongoAdapter.execute_query() expects the filter dict directly.
-        # Params are unused for Mongo — pass None as per the interface contract.
+        # Pass the full dict to the adapter. MongoAdapter.execute_query() will:
+        #   • Use .find(filter)     if "filter" key is present
+        #   • Use .aggregate(pipeline) if "pipeline" key is present
         try:
             rows = self.adapter.execute_query(generated_query, None)
         except Exception as exc:
             raise RuntimeError(
-                f"SQLFilterStrategy (Mongo) failed to execute query.\n"
-                f"Filter: {generated_query}\n"
+                f"[MongoDB] SQLFilterStrategy failed to execute query.\n"
+                f"Query : {json.dumps(generated_query, ensure_ascii=False, default=str)}\n"
                 f"Error : {exc}"
             ) from exc
 
@@ -301,10 +357,18 @@ class SQLFilterStrategy(BaseStrategy):
         rows = rows[: self._settings.MAX_RESULT_ROWS]
 
         # ── 5. Return ────────────────────────────────────────────────────────
+        # Format query_used as readable JSON for the frontend SQL preview panel.
+        query_type = "pipeline" if "pipeline" in generated_query else "filter"
+        query_display = json.dumps(generated_query, ensure_ascii=False, indent=2)
+
         return StrategyResult(
             rows=rows,
-            query_used=str(generated_query),
+            query_used=query_display,
             strategy_name=self.strategy_name,
             row_count=len(rows),
-            metadata={"question": question},
+            metadata={
+                "question": question,
+                "query_type": query_type,
+                "collection": generated_query.get("collection"),
+            },
         )
