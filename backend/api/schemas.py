@@ -35,3 +35,37 @@ class HealthResponse(BaseModel):
     db_connected: bool
     llm_provider: str
     strategy: str
+
+class MessageRecord(BaseModel):
+    id: str
+    chat_id: str
+    role: str                    # "user" | "assistant"
+    question: str
+    sql: str | None = None
+    answer: str | None = None
+    strategy_used: str | None = None
+    row_count: int | None = None
+    created_at: datetime
+
+
+class ChatRecord(BaseModel):
+    id: str
+    user_id: str
+    title: str
+    created_at: datetime
+    updated_at: datetime
+
+
+class CreateChatRequest(BaseModel):
+    user_id: str
+    title: str = "New Chat"
+
+
+class SaveMessageRequest(BaseModel):
+    user_id: str
+    role: str
+    question: str
+    sql: str | None = None
+    answer: str | None = None
+    strategy_used: str | None = None
+    row_count: int | None = None

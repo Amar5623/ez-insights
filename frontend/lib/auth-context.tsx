@@ -1,84 +1,92 @@
 'use client'
-
 import { createContext, useContext, useState, useEffect, type ReactNode } from 'react'
 import type { User } from './types'
 
 interface AuthContextType {
   user: User | null
+  token: string | null
   isLoading: boolean
   login: (email: string, password: string) => Promise<void>
   signup: (email: string, password: string, name: string) => Promise<void>
-  logout: () => void
+  logout: () => Promise<void>
 }
 
 const AuthContext = createContext<AuthContextType | null>(null)
 
+const TOKEN_KEY = 'ez_insights_token'
+
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null)
+  const [token, setToken] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(true)
 
+  // On mount, restore token from localStorage and verify with /api/auth/me
   useEffect(() => {
-    // Check for stored session on mount
-    const storedUser = localStorage.getItem('ez_insights_user')
-    if (storedUser) {
-      try {
-        setUser(JSON.parse(storedUser))
-      } catch {
-        localStorage.removeItem('ez_insights_user')
-      }
+    const storedToken = localStorage.getItem(TOKEN_KEY)
+    if (!storedToken) {
+      setIsLoading(false)
+      return
     }
-    setIsLoading(false)
+    setToken(storedToken)
+    fetch('/api/auth/me', {
+      headers: { Authorization: `Bearer ${storedToken}` },
+    })
+      .then(res => (res.ok ? res.json() : null))
+      .then(data => {
+        if (data?.user) {
+          setUser(data.user)
+        } else {
+          // Token is stale — clear it
+          setToken(null)
+          localStorage.removeItem(TOKEN_KEY)
+        }
+      })
+      .catch(() => {
+        setToken(null)
+        localStorage.removeItem(TOKEN_KEY)
+      })
+      .finally(() => setIsLoading(false))
   }, [])
 
   const login = async (email: string, password: string) => {
-    // Simulate API call - replace with real backend auth
-    await new Promise(resolve => setTimeout(resolve, 500))
-    
-    if (!email || !password) {
-      throw new Error('Email and password are required')
-    }
-
-    // Demo login - in production, this would validate against backend
-    const newUser: User = {
-      id: crypto.randomUUID(),
-      email,
-      name: email.split('@')[0],
-    }
-    
-    setUser(newUser)
-    localStorage.setItem('ez_insights_user', JSON.stringify(newUser))
+    const res = await fetch('/api/auth/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password }),
+    })
+    const data = await res.json()
+    if (!res.ok) throw new Error(data.detail || 'Login failed')
+    setUser(data.user)
+    setToken(data.token)
+    localStorage.setItem(TOKEN_KEY, data.token)
   }
 
   const signup = async (email: string, password: string, name: string) => {
-    // Simulate API call - replace with real backend auth
-    await new Promise(resolve => setTimeout(resolve, 500))
-    
-    if (!email || !password || !name) {
-      throw new Error('All fields are required')
-    }
-
-    if (password.length < 6) {
-      throw new Error('Password must be at least 6 characters')
-    }
-
-    const newUser: User = {
-      id: crypto.randomUUID(),
-      email,
-      name,
-    }
-    
-    setUser(newUser)
-    localStorage.setItem('ez_insights_user', JSON.stringify(newUser))
+    const res = await fetch('/api/auth/signup', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email, password, name }),
+    })
+    const data = await res.json()
+    if (!res.ok) throw new Error(data.detail || 'Signup failed')
+    setUser(data.user)
+    setToken(data.token)
+    localStorage.setItem(TOKEN_KEY, data.token)
   }
 
-  const logout = () => {
+  const logout = async () => {
+    await fetch('/api/auth/logout', {
+      method: 'POST',
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    })
     setUser(null)
-    localStorage.removeItem('ez_insights_user')
+    setToken(null)
+    localStorage.removeItem(TOKEN_KEY)
     localStorage.removeItem('ez_insights_chats')
   }
 
   return (
-    <AuthContext.Provider value={{ user, isLoading, login, signup, logout }}>
+    <AuthContext.Provider value={{ user, token, isLoading, login, signup, logout }}>
       {children}
     </AuthContext.Provider>
   )
@@ -86,8 +94,6 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
 export function useAuth() {
   const context = useContext(AuthContext)
-  if (!context) {
-    throw new Error('useAuth must be used within an AuthProvider')
-  }
+  if (!context) throw new Error('useAuth must be used within an AuthProvider')
   return context
 }

@@ -1,123 +1,215 @@
 'use client'
 
-import { createContext, useContext, useState, useEffect, useCallback, type ReactNode } from 'react'
+import {
+  createContext,
+  useContext,
+  useState,
+  useEffect,
+  useCallback,
+  type ReactNode,
+} from 'react'
 import type { Chat, ChatMessage } from './types'
-import { sendQuery } from './api'
+import { sendQuery, fetchChats, createChat, deleteChatAPI, fetchMessages, updateChatTitle, setActiveChatContext } from './api'
+import { useAuth } from './auth-context'
+
+// ── Types ─────────────────────────────────────────────────────────────────────
 
 interface ChatContextType {
   chats: Chat[]
   currentChat: Chat | null
   isLoading: boolean
   isSending: boolean
-  createNewChat: () => void
-  selectChat: (chatId: string) => void
-  deleteChat: (chatId: string) => void
+  createNewChat: () => Promise<void>
+  selectChat: (chatId: string) => Promise<void>
+  deleteChat: (chatId: string) => Promise<void>
   sendMessage: (content: string) => Promise<void>
 }
 
 const ChatContext = createContext<ChatContextType | null>(null)
 
-const STORAGE_KEY = 'ez_insights_chats'
-// Removed MAX_RECENT_CHATS limit — chats are now unlimited
+const CONTEXT_WINDOW_SIZE = 5
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+function buildContextWindow(messages: ChatMessage[]): Array<{ question: string; sql: string; answer: string }> {
+  // Walk backwards through completed message pairs, collect up to CONTEXT_WINDOW_SIZE turns
+  const completed = messages.filter(m => !m.isLoading)
+  const turns: Array<{ question: string; sql: string; answer: string }> = []
+
+  for (let i = completed.length - 1; i >= 1 && turns.length < CONTEXT_WINDOW_SIZE; i--) {
+    const msg = completed[i]
+    const prev = completed[i - 1]
+    if (msg.role === 'assistant' && prev.role === 'user') {
+      turns.unshift({
+        question: prev.content,
+        sql: msg.sql || '',
+        answer: msg.content,
+      })
+      i-- // skip the user message we just consumed
+    }
+  }
+
+  return turns
+}
+
+function generateChatTitle(firstMessage: string): string {
+  return firstMessage.slice(0, 40) + (firstMessage.length > 40 ? '...' : '')
+}
+
+// ── Provider ──────────────────────────────────────────────────────────────────
 
 export function ChatProvider({ children }: { children: ReactNode }) {
+  const { user } = useAuth()
   const [chats, setChats] = useState<Chat[]>([])
   const [currentChatId, setCurrentChatId] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [isSending, setIsSending] = useState(false)
 
-  // Load chats from localStorage on mount
+  const currentChat = chats.find(c => c.id === currentChatId) ?? null
+
+  // Keep api.ts in sync whenever active chat or user changes
   useEffect(() => {
-    const stored = localStorage.getItem(STORAGE_KEY)
-    if (stored) {
+    setActiveChatContext(currentChatId, user?.id ?? null)
+  }, [currentChatId, user?.id])
+
+  // ── Load chats on mount ──────────────────────────────────────────────────────
+
+  useEffect(() => {
+    if (!user) {
+      setChats([])
+      setCurrentChatId(null)
+      setIsLoading(false)
+      return
+    }
+
+    const loadChats = async () => {
+      setIsLoading(true)
       try {
-        const parsed = JSON.parse(stored) as Chat[]
-        // Convert date strings back to Date objects
-        const restored = parsed.map(chat => ({
-          ...chat,
-          created_at: new Date(chat.created_at),
-          updated_at: new Date(chat.updated_at),
-          messages: chat.messages.map(msg => ({
-            ...msg,
-            timestamp: new Date(msg.timestamp),
-          })),
+        const remote = await fetchChats(user.id)
+        const restored: Chat[] = remote.map(c => ({
+          id: c.id,
+          title: c.title,
+          messages: [],           // messages load lazily when chat is selected
+          created_at: new Date(c.created_at),
+          updated_at: new Date(c.updated_at),
         }))
         setChats(restored)
         if (restored.length > 0) {
+          // Auto-select most recent chat and load its messages
+          await loadMessagesIntoChat(restored[0].id, user.id, restored)
           setCurrentChatId(restored[0].id)
         }
-      } catch {
-        localStorage.removeItem(STORAGE_KEY)
+      } catch (err) {
+        console.error('[chat] Failed to load chats:', err)
+      } finally {
+        setIsLoading(false)
       }
     }
-    setIsLoading(false)
-  }, [])
 
-  // Save chats to localStorage whenever they change
-  useEffect(() => {
-    if (!isLoading) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(chats))
+    loadChats()
+  }, [user])
+
+  // ── Load messages for a chat ─────────────────────────────────────────────────
+
+  const loadMessagesIntoChat = async (
+    chatId: string,
+    userId: string,
+    chatList: Chat[],
+  ): Promise<Chat[]> => {
+    try {
+      const remote = await fetchMessages(chatId, userId)
+      const messages: ChatMessage[] = remote.map(m => ({
+        id: m.id,
+        role: m.role,
+        content: m.role === 'assistant' ? (m.answer ?? '') : m.question,
+        sql: m.sql ?? undefined,
+        results: undefined,        // results not stored in DB — only shown live
+        row_count: m.row_count ?? undefined,
+        strategy_used: m.strategy_used ?? undefined,
+        timestamp: new Date(m.created_at),
+      }))
+
+      const updated = chatList.map(c =>
+        c.id === chatId ? { ...c, messages } : c,
+      )
+      setChats(updated)
+      return updated
+    } catch (err) {
+      console.error('[chat] Failed to load messages:', err)
+      return chatList
     }
-  }, [chats, isLoading])
+  }
 
-  const currentChat = chats.find(c => c.id === currentChatId) || null
+  // ── Actions ──────────────────────────────────────────────────────────────────
 
-  const createNewChat = useCallback(() => {
-    const newChat: Chat = {
-      id: crypto.randomUUID(),
-      title: 'New Chat',
-      messages: [],
-      created_at: new Date(),
-      updated_at: new Date(),
+  const createNewChat = useCallback(async () => {
+    if (!user) return
+    try {
+      const remote = await createChat(user.id, 'New Chat')
+      const newChat: Chat = {
+        id: remote.id,
+        title: remote.title,
+        messages: [],
+        created_at: new Date(remote.created_at),
+        updated_at: new Date(remote.updated_at),
+      }
+      setChats(prev => [newChat, ...prev])
+      setCurrentChatId(newChat.id)
+    } catch (err) {
+      console.error('[chat] Failed to create chat:', err)
     }
+  }, [user])
 
-    // No limit — prepend the new chat to the list
-    setChats(prev => [newChat, ...prev])
-    setCurrentChatId(newChat.id)
-  }, [])
-
-  const selectChat = useCallback((chatId: string) => {
+  const selectChat = useCallback(async (chatId: string) => {
+    if (!user) return
     setCurrentChatId(chatId)
-  }, [])
 
-  const deleteChat = useCallback((chatId: string) => {
-    setChats(prev => {
-      const filtered = prev.filter(c => c.id !== chatId)
-      // If we deleted the current chat, switch to another or clear
-      if (currentChatId === chatId) {
-        setCurrentChatId(filtered.length > 0 ? filtered[0].id : null)
-      }
-      return filtered
-    })
-  }, [currentChatId])
+    // Only load messages if not already loaded
+    const existing = chats.find(c => c.id === chatId)
+    if (existing && existing.messages.length === 0) {
+      await loadMessagesIntoChat(chatId, user.id, chats)
+    }
+  }, [user, chats])
+
+  const deleteChat = useCallback(async (chatId: string) => {
+    if (!user) return
+    try {
+      await deleteChatAPI(chatId, user.id)
+      setChats(prev => {
+        const next = prev.filter(c => c.id !== chatId)
+        // If we deleted the active chat, switch to the next available one
+        if (currentChatId === chatId) {
+          setCurrentChatId(next.length > 0 ? next[0].id : null)
+        }
+        return next
+      })
+    } catch (err) {
+      console.error('[chat] Failed to delete chat:', err)
+    }
+  }, [user, currentChatId])
 
   const sendMessage = useCallback(async (content: string) => {
-    if (!content.trim() || isSending) return
+    if (!user || !currentChatId || isSending) return
 
-    let chatId = currentChatId
-
-    // Create new chat if none exists
-    if (!chatId) {
-      const newChat: Chat = {
-        id: crypto.randomUUID(),
-        title: content.slice(0, 30) + (content.length > 30 ? '...' : ''),
-        messages: [],
-        created_at: new Date(),
-        updated_at: new Date(),
-      }
-      // No limit — prepend the new chat to the list
-      setChats(prev => [newChat, ...prev])
-      chatId = newChat.id
-      setCurrentChatId(chatId)
+    // If this is the first message, auto-title the chat
+    const chat = chats.find(c => c.id === currentChatId)
+    const isFirstMessage = chat?.messages.length === 0
+    if (isFirstMessage) {
+      const title = generateChatTitle(content)
+      setChats(prev => prev.map(c =>
+        c.id === currentChatId ? { ...c, title } : c,
+      ))
+      // Persist title update to backend (fire and forget)
+      updateChatTitle(currentChatId, user.id, title).catch(() => {})
     }
 
+    // Optimistically add user message + loading placeholder
     const userMessage: ChatMessage = {
       id: crypto.randomUUID(),
       role: 'user',
       content,
       timestamp: new Date(),
     }
-
     const loadingMessage: ChatMessage = {
       id: crypto.randomUUID(),
       role: 'assistant',
@@ -126,24 +218,21 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       isLoading: true,
     }
 
-    // Add user message and loading state immediately
-    setChats(prev => prev.map(chat => {
-      if (chat.id === chatId) {
-        const isFirstMessage = chat.messages.length === 0
-        return {
-          ...chat,
-          title: isFirstMessage ? content.slice(0, 30) + (content.length > 30 ? '...' : '') : chat.title,
-          messages: [...chat.messages, userMessage, loadingMessage],
-          updated_at: new Date(),
-        }
-      }
-      return chat
-    }))
+    setChats(prev => prev.map(c =>
+      c.id === currentChatId
+        ? { ...c, messages: [...c.messages, userMessage, loadingMessage], updated_at: new Date() }
+        : c,
+    ))
 
     setIsSending(true)
 
     try {
-      const response = await sendQuery({ question: content })
+      // Build sliding window context from this chat's completed messages
+      const currentMessages = chat?.messages ?? []
+      const context = buildContextWindow(currentMessages)
+
+      // api.ts automatically sends X-Chat-Id and X-User-Id headers
+      const response = await sendQuery({ question: content, context })
 
       const assistantMessage: ChatMessage = {
         id: loadingMessage.id,
@@ -156,19 +245,17 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         timestamp: new Date(),
       }
 
-      // Replace loading message with actual response
-      setChats(prev => prev.map(chat => {
-        if (chat.id === chatId) {
-          return {
-            ...chat,
-            messages: chat.messages.map(msg =>
-              msg.id === loadingMessage.id ? assistantMessage : msg
-            ),
-            updated_at: new Date(),
-          }
-        }
-        return chat
-      }))
+      setChats(prev => prev.map(c =>
+        c.id === currentChatId
+          ? {
+              ...c,
+              messages: c.messages.map(m =>
+                m.id === loadingMessage.id ? assistantMessage : m,
+              ),
+              updated_at: new Date(),
+            }
+          : c,
+      ))
     } catch (error) {
       const errorMessage: ChatMessage = {
         id: loadingMessage.id,
@@ -177,23 +264,20 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         timestamp: new Date(),
       }
 
-      // Replace loading message with error
-      setChats(prev => prev.map(chat => {
-        if (chat.id === chatId) {
-          return {
-            ...chat,
-            messages: chat.messages.map(msg =>
-              msg.id === loadingMessage.id ? errorMessage : msg
-            ),
-            updated_at: new Date(),
-          }
-        }
-        return chat
-      }))
+      setChats(prev => prev.map(c =>
+        c.id === currentChatId
+          ? {
+              ...c,
+              messages: c.messages.map(m =>
+                m.id === loadingMessage.id ? errorMessage : m,
+              ),
+            }
+          : c,
+      ))
     } finally {
       setIsSending(false)
     }
-  }, [currentChatId, isSending])
+  }, [user, currentChatId, isSending, chats])
 
   return (
     <ChatContext.Provider value={{
@@ -213,8 +297,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
 export function useChat() {
   const context = useContext(ChatContext)
-  if (!context) {
-    throw new Error('useChat must be used within a ChatProvider')
-  }
+  if (!context) throw new Error('useChat must be used within a ChatProvider')
   return context
 }

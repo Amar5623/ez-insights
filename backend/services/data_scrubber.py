@@ -1,12 +1,10 @@
 """
 services/data_scrubber.py
 Dev 2 owns this file — TASK-02 Sensitive Data Masking — Layer 3.
-
 Last line of defence. Even if Layers 1 and 2 somehow missed something,
 this scrubber pattern-matches all string values in the query results
 and replaces any sensitive data with [REDACTED] before it ever reaches
 the LLM answer prompt or the API response.
-
 Usage (called in query_service.py):
     from services.data_scrubber import scrub_rows
     rows = scrub_rows(rows)
