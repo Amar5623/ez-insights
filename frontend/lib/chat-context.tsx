@@ -19,7 +19,7 @@ interface ChatContextType {
   currentChat: Chat | null
   isLoading: boolean
   isSending: boolean
-  createNewChat: () => Promise<void>
+  createNewChat: () => Promise<Chat | undefined>
   selectChat: (chatId: string) => Promise<void>
   deleteChat: (chatId: string) => Promise<void>
   sendMessage: (content: string) => Promise<void>
@@ -32,7 +32,6 @@ const CONTEXT_WINDOW_SIZE = 5
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function buildContextWindow(messages: ChatMessage[]): Array<{ question: string; sql: string; answer: string }> {
-  // Walk backwards through completed message pairs, collect up to CONTEXT_WINDOW_SIZE turns
   const completed = messages.filter(m => !m.isLoading)
   const turns: Array<{ question: string; sql: string; answer: string }> = []
 
@@ -45,7 +44,7 @@ function buildContextWindow(messages: ChatMessage[]): Array<{ question: string; 
         sql: msg.sql || '',
         answer: msg.content,
       })
-      i-- // skip the user message we just consumed
+      i--
     }
   }
 
@@ -67,7 +66,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
   const currentChat = chats.find(c => c.id === currentChatId) ?? null
 
-  // Keep api.ts in sync whenever active chat or user changes
   useEffect(() => {
     setActiveChatContext(currentChatId, user?.id ?? null)
   }, [currentChatId, user?.id])
@@ -89,13 +87,12 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         const restored: Chat[] = remote.map(c => ({
           id: c.id,
           title: c.title,
-          messages: [],           // messages load lazily when chat is selected
+          messages: [],
           created_at: new Date(c.created_at),
           updated_at: new Date(c.updated_at),
         }))
         setChats(restored)
         if (restored.length > 0) {
-          // Auto-select most recent chat and load its messages
           await loadMessagesIntoChat(restored[0].id, user.id, restored)
           setCurrentChatId(restored[0].id)
         }
@@ -123,7 +120,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         role: m.role,
         content: m.role === 'assistant' ? (m.answer ?? '') : m.question,
         sql: m.sql ?? undefined,
-        results: undefined,        // results not stored in DB — only shown live
+        results: undefined,
         row_count: m.row_count ?? undefined,
         strategy_used: m.strategy_used ?? undefined,
         timestamp: new Date(m.created_at),
@@ -155,6 +152,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       }
       setChats(prev => [newChat, ...prev])
       setCurrentChatId(newChat.id)
+      return newChat
     } catch (err) {
       console.error('[chat] Failed to create chat:', err)
     }
@@ -164,7 +162,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     if (!user) return
     setCurrentChatId(chatId)
 
-    // Only load messages if not already loaded
     const existing = chats.find(c => c.id === chatId)
     if (existing && existing.messages.length === 0) {
       await loadMessagesIntoChat(chatId, user.id, chats)
@@ -177,7 +174,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       await deleteChatAPI(chatId, user.id)
       setChats(prev => {
         const next = prev.filter(c => c.id !== chatId)
-        // If we deleted the active chat, switch to the next available one
         if (currentChatId === chatId) {
           setCurrentChatId(next.length > 0 ? next[0].id : null)
         }
@@ -189,21 +185,25 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   }, [user, currentChatId])
 
   const sendMessage = useCallback(async (content: string) => {
-    if (!user || !currentChatId || isSending) return
+    if (!user || isSending) return
 
-    // If this is the first message, auto-title the chat
-    const chat = chats.find(c => c.id === currentChatId)
-    const isFirstMessage = chat?.messages.length === 0
+    let activeChatId = currentChatId
+    if (!activeChatId) {
+      const newChat = await createNewChat()
+      if (!newChat) return
+      activeChatId = newChat.id
+    }
+
+    const chat = chats.find(c => c.id === activeChatId) ?? { messages: [] as ChatMessage[] }
+    const isFirstMessage = chat.messages.length === 0
     if (isFirstMessage) {
       const title = generateChatTitle(content)
       setChats(prev => prev.map(c =>
-        c.id === currentChatId ? { ...c, title } : c,
+        c.id === activeChatId ? { ...c, title } : c,
       ))
-      // Persist title update to backend (fire and forget)
-      updateChatTitle(currentChatId, user.id, title).catch(() => {})
+      updateChatTitle(activeChatId, user.id, title).catch(() => {})
     }
 
-    // Optimistically add user message + loading placeholder
     const userMessage: ChatMessage = {
       id: crypto.randomUUID(),
       role: 'user',
@@ -219,7 +219,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     }
 
     setChats(prev => prev.map(c =>
-      c.id === currentChatId
+      c.id === activeChatId
         ? { ...c, messages: [...c.messages, userMessage, loadingMessage], updated_at: new Date() }
         : c,
     ))
@@ -227,11 +227,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     setIsSending(true)
 
     try {
-      // Build sliding window context from this chat's completed messages
-      const currentMessages = chat?.messages ?? []
-      const context = buildContextWindow(currentMessages)
-
-      // api.ts automatically sends X-Chat-Id and X-User-Id headers
+      const context = buildContextWindow(chat.messages)
       const response = await sendQuery({ question: content, context })
 
       const assistantMessage: ChatMessage = {
@@ -246,7 +242,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       }
 
       setChats(prev => prev.map(c =>
-        c.id === currentChatId
+        c.id === activeChatId
           ? {
               ...c,
               messages: c.messages.map(m =>
@@ -265,7 +261,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       }
 
       setChats(prev => prev.map(c =>
-        c.id === currentChatId
+        c.id === activeChatId
           ? {
               ...c,
               messages: c.messages.map(m =>
@@ -277,7 +273,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     } finally {
       setIsSending(false)
     }
-  }, [user, currentChatId, isSending, chats])
+  }, [user, currentChatId, isSending, chats, createNewChat])
 
   return (
     <ChatContext.Provider value={{
