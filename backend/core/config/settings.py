@@ -80,6 +80,9 @@ class Settings(BaseSettings):
     API_KEY: str = "change-me-in-env"
     CORS_ORIGINS: list[str] = ["http://localhost:5173"]
 
+    INTENT_CLASSIFIER_ENABLED: bool = True
+    INTENT_LLM_FALLBACK: bool = True
+
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
