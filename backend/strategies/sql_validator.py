@@ -18,6 +18,41 @@ Usage in any strategy:
     is_valid, error = validator.validate(query)
     if not is_valid:
         raise ValueError(f"Query blocked by validator: {error}")
+
+──────────────────────────────────────────────────────────────────────────────
+MYSQL vs MONGODB — what this file validates differently
+──────────────────────────────────────────────────────────────────────────────
+
+  MySQLValidator  — validates a SQL string
+    • Must start with SELECT (read-only enforcement)
+    • Blocks DDL/DML keywords (DROP, DELETE, INSERT, …)
+    • Blocks comment injection, UNION injection, tautologies
+    • Uses sqlparse for tokenisation
+
+  MongoValidator  — validates a dict (filter) or list (pipeline)
+    • Blocks JavaScript execution ($where, $function, $accumulator)
+    • Blocks write operators that cannot appear in read queries
+      ($set, $unset, $push, $pull, … but NOT $min/$max — see note below)
+    • Blocks aggregation output operators ($out, $merge)
+    • Blocks unanchored $regex patterns (ReDoS risk)
+    • Enforces max nesting depth
+
+  NOTE on $min / $max:
+    These operators are DUAL-PURPOSE in MongoDB:
+      - As update modifiers  : db.col.update({}, {$max: {price: 100}})  ← dangerous
+      - As aggregation accum : {$group: {top: {$max: "$price"}}}         ← read-only safe
+
+    The validator cannot distinguish the two contexts structurally, and
+    blocking them would prevent all aggregation queries using $min/$max
+    (e.g. "what is the highest-priced product?").
+
+    Since this service only ever executes READ operations, $min/$max in
+    an aggregation pipeline cannot cause writes. They are therefore
+    NOT in _MONGO_WRITE_OPERATORS.
+
+    $sum, $avg, $count — also aggregation accumulators — were never in
+    the write-operators list for the same reason.
+──────────────────────────────────────────────────────────────────────────────
 """
 
 from __future__ import annotations
@@ -58,9 +93,13 @@ class BaseQueryValidator(ABC):
         ...
 
 
-# ─── MySQL ───────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# MYSQL VALIDATOR
+# ── All code below this header is MySQL-specific ──────────────────────────────
+# ── Do not modify unless you are changing MySQL validation logic ───────────────
+# ═══════════════════════════════════════════════════════════════════════════════
 
-# DDL / DML keywords that must never appear in a read-only query.
+# DDL / DML keywords that must never appear in a read-only MySQL query.
 _MYSQL_DANGEROUS_KEYWORDS: frozenset[str] = frozenset({
     # Data manipulation
     "INSERT", "UPDATE", "DELETE", "REPLACE", "MERGE",
@@ -139,6 +178,8 @@ _MYSQL_STACKED_STMT_RE = re.compile(r";")
 class MySQLValidator(BaseQueryValidator):
     """
     Validates SQL strings intended for MySQL execution.
+
+    MYSQL-SPECIFIC — not used for MongoDB queries.
 
     Checks (in order):
     1.  Input type — must be a non-empty string.
@@ -246,7 +287,11 @@ class MySQLValidator(BaseQueryValidator):
         return True, None
 
 
-# ─── MongoDB ─────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# MONGODB VALIDATOR
+# ── All code below this header is MongoDB-specific ────────────────────────────
+# ── Do not modify unless you are changing MongoDB validation logic ─────────────
+# ═══════════════════════════════════════════════════════════════════════════════
 
 # Mongo operators that allow JavaScript execution on the server.
 _MONGO_JS_OPERATORS: frozenset[str] = frozenset({
@@ -255,10 +300,23 @@ _MONGO_JS_OPERATORS: frozenset[str] = frozenset({
     "$accumulator",   # custom accumulator (JS)
 })
 
-# Operators that can cause unintended writes or privilege escalation.
+# Operators that can cause unintended WRITES when used in an update context.
+#
+# NOTE: $min and $max are intentionally NOT in this set.
+#
+#   They are dual-purpose:
+#     - Update modifier : db.col.update({}, {$max: {price: 100}})  ← write
+#     - Aggregation acc : {$group: {top: {$max: "$price"}}}         ← read-only
+#
+#   Since this service only ever executes READ operations (the LLM generates
+#   find/aggregate queries, never update commands), blocking $min/$max would
+#   prevent legitimate aggregation queries like "what is the max price?"
+#   without any security benefit.
+#
+#   $sum, $avg, $count are in the same category and were never blocked.
 _MONGO_WRITE_OPERATORS: frozenset[str] = frozenset({
     "$set", "$unset", "$push", "$pull", "$addToSet",
-    "$pop", "$rename", "$inc", "$mul", "$min", "$max",
+    "$pop", "$rename", "$inc", "$mul",
     "$currentDate", "$bit",
 })
 
@@ -266,11 +324,6 @@ _MONGO_WRITE_OPERATORS: frozenset[str] = frozenset({
 _MONGO_EXFIL_OPERATORS: frozenset[str] = frozenset({
     "$out",       # writes pipeline results to a collection
     "$merge",     # merges pipeline results into a collection
-})
-
-# Operators used in ReDoS or resource exhaustion attacks.
-_MONGO_DOS_OPERATORS: frozenset[str] = frozenset({
-    "$regex",     # unanchored regex on large collections = ReDoS
 })
 
 # Maximum nesting depth for a Mongo query — deep nesting can hide dangerous
@@ -283,7 +336,7 @@ def _walk_mongo_doc(
     depth: int = 0,
 ) -> ValidationResult:
     """
-    Recursively walk a Mongo query document or pipeline stage.
+    MONGO-SPECIFIC: Recursively walk a Mongo query document or pipeline stage.
 
     Checks every key and value, regardless of nesting level.
 
@@ -327,9 +380,6 @@ def _walk_mongo_doc(
                 return False, "JavaScript execution via '$where' is not permitted"
 
             # ── Operator injection via value keys ─────────────────────────────
-            # E.g. {"field": {"$where": "..."}}  — already caught above on
-            # recursive descent, but handle string values that look like
-            # operator payloads.
             if isinstance(value, str) and value.startswith("$"):
                 if value in _MONGO_JS_OPERATORS:
                     return False, f"Operator as value '{value}' is not permitted"
@@ -351,13 +401,14 @@ def _walk_mongo_doc(
 
 class MongoValidator(BaseQueryValidator):
     """
-    Validates MongoDB query filter dicts and aggregation pipeline lists.
+    MONGO-SPECIFIC: Validates MongoDB query filter dicts and aggregation pipelines.
 
     Checks (in order):
     1.  Input type — must be dict or list (pipeline), never a raw string.
     2.  Nesting depth guard (prevents stack exhaustion).
     3.  JavaScript execution operators ($where, $function, $accumulator).
     4.  Write operators inside a read query ($set, $push, …).
+        Note: $min/$max are NOT blocked — see module docstring.
     5.  Aggregation output operators ($out, $merge).
     6.  Unanchored $regex patterns (ReDoS).
     7.  Operator-as-value injection.
@@ -415,7 +466,7 @@ def get_validator(db_type: str) -> BaseQueryValidator:
 
 def validate_sql(sql: str) -> ValidationResult:
     """
-    Thin wrapper around MySQLValidator.validate() for backward compatibility.
+    MYSQL-SPECIFIC: Thin wrapper around MySQLValidator.validate().
 
     Prefer get_validator(adapter.db_type).validate(query) in new code.
     """

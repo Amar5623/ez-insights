@@ -7,32 +7,58 @@ in a name, title, brand, or author — for both MySQL and MongoDB.
 
 How it fits in the system:
     1. QueryService calls strategy.execute(question, generated_query)
-    2. generated_query is a SQL string (MySQL) or filter dict (MongoDB)
+    2. generated_query is a SQL string (MySQL) or a query dict (MongoDB)
        produced by the LLM — it contains the user's (possibly misspelled)
        search term
     3. FuzzyMatchStrategy:
          a. Extracts the search term from the generated query
-         b. Fetches all real candidate values from the DB column
+         b. Fetches all real candidate values from the DB column/field
          c. Scores each candidate using Levenshtein distance
          d. Picks the best match within tolerance
          e. Re-runs the query with the corrected term substituted in
          f. Returns results + distance metadata
 
-Flow:
-    execute(question, generated_query)
-        ├── _extract_search_term()     → what did the user search for?
-        ├── _fetch_candidates()        → what values exist in the DB?
-        ├── _find_best_match()         → which candidate is closest?
-        ├── _build_corrected_query()   → substitute best match into query
-        └── adapter.execute_query()   → run corrected query, return rows
+──────────────────────────────────────────────────────────────────────────────
+MYSQL vs MONGODB — what this strategy does differently
+──────────────────────────────────────────────────────────────────────────────
+
+  MySQL:
+    generated_query is a str  →  "SELECT * FROM books WHERE name LIKE '%Tolkein%'"
+    _execute_mysql():
+      • Validates the SQL string
+      • Extracts the search term + column from the WHERE clause via regex
+      • Fetches all distinct values from that column with a DISTINCT query
+      • Runs Levenshtein on all candidates → picks best match
+      • Substitutes corrected term back into the SQL string
+      • Executes the corrected SQL
+
+  MongoDB:
+    generated_query is a dict → {"collection": "books",
+                                   "filter": {"name": "Tolkein"},
+                                   "limit": 20}
+    _execute_mongo():
+      • Validates the query dict
+      • Extracts collection name from the top-level "collection" key
+      • Extracts the filter portion (NOT the whole dict) and gets search term
+      • Fetches candidates by running a bare find({}) on the collection
+        and extracting distinct field values  ← previously BROKEN (used a
+        fictional {"_fuzzy_candidates_field": ...} protocol that the adapter
+        didn't understand — now fixed with a real find query)
+      • Runs Levenshtein on all candidates → picks best match
+      • Builds a corrected query dict preserving the "collection" key
+      • Executes the corrected query
+
+  Key invariant: the "collection" key is always preserved in the corrected
+  MongoDB query. The MySQL path operates on strings only and never touches
+  collection names.
 
 Requires: pip install python-Levenshtein  (already in requirements.txt)
 """
 
 from __future__ import annotations
 
-import re
 import json
+import re
 from typing import Any
 
 import Levenshtein
@@ -99,7 +125,10 @@ class FuzzyMatchStrategy(BaseStrategy):
              Levenshtein distance, substitutes the corrected term back into
              the SQL, and executes the corrected query.
 
-    MongoDB — same logic applied to the filter dict's string values.
+    MongoDB — same logic applied to the filter dict's string values,
+              but correctly extracts the filter from the full LLM dict
+              and rebuilds a complete query dict (with "collection" key)
+              for the corrected query.
 
     The adapter type is read from self.adapter.db_type at runtime.
     """
@@ -124,7 +153,7 @@ class FuzzyMatchStrategy(BaseStrategy):
 
         Args:
             question:        Original natural language question.
-            generated_query: SQL string (MySQL) or filter dict (MongoDB)
+            generated_query: SQL string (MySQL) or query dict (MongoDB)
                              from the LLM.
 
         Returns:
@@ -132,14 +161,16 @@ class FuzzyMatchStrategy(BaseStrategy):
 
         Raises:
             ValueError:   If no search term can be extracted, or no
-                          candidates exist in the DB column.
+                          candidates exist in the DB column/field.
             RuntimeError: If the adapter fails during execution.
         """
         db = self.adapter.db_type.lower()
 
+        # ── MySQL path ────────────────────────────────────────────────────────
         if db == "mysql":
             return self._execute_mysql(question, generated_query)
 
+        # ── MongoDB path ──────────────────────────────────────────────────────
         if db in ("mongo", "mongodb"):
             return self._execute_mongo(question, generated_query)
 
@@ -157,6 +188,8 @@ class FuzzyMatchStrategy(BaseStrategy):
             1. At least one positive pattern must match (proper noun, "by X",
                "named X", quoted string, etc.)
             2. No negative pattern must match (about, related to, theme, etc.)
+
+        Works the same for MySQL and MongoDB (question text is DB-agnostic).
         """
         if not question or not question.strip():
             return False
@@ -177,11 +210,15 @@ class FuzzyMatchStrategy(BaseStrategy):
     def strategy_name(self) -> str:
         return "fuzzy"
 
-    # ── MySQL execution path ──────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # MYSQL EXECUTION PATH
+    # All methods in this section operate on SQL strings only.
+    # They are never called when DB_TYPE=mongo.
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _execute_mysql(self, question: str, generated_query: Any) -> StrategyResult:
         """
-        Full fuzzy match pipeline for MySQL.
+        MYSQL-SPECIFIC: Full fuzzy match pipeline for MySQL.
 
         Steps:
             1. Type-check generated_query — must be a SQL string
@@ -197,32 +234,33 @@ class FuzzyMatchStrategy(BaseStrategy):
         # ── 1. Type check ────────────────────────────────────────────────────
         if not isinstance(generated_query, str):
             raise ValueError(
-                f"MySQL expects a SQL string, got {type(generated_query).__name__}."
+                f"[MySQL] FuzzyMatchStrategy expects a SQL string, "
+                f"got {type(generated_query).__name__}."
             )
 
         sql = generated_query.strip()
         if not sql:
-            raise ValueError("Generated SQL query is empty.")
+            raise ValueError("[MySQL] Generated SQL query is empty.")
 
         # ── 2. Validate original query ───────────────────────────────────────
         validator = get_validator("mysql")
         is_valid, error = validator.validate(sql)
         if not is_valid:
-            raise ValueError(f"Query blocked by validator: {error}")
+            raise ValueError(f"[MySQL] Query blocked by validator: {error}")
 
         # ── 3. Extract search term ───────────────────────────────────────────
         search_term, column_name = self._extract_mysql_term_and_column(sql)
 
         if not search_term:
             raise ValueError(
-                f"FuzzyMatchStrategy could not extract a search term from: {sql}"
+                f"[MySQL] FuzzyMatchStrategy could not extract a search term from: {sql}"
             )
 
         # ── 4. Determine table name ──────────────────────────────────────────
         table_name = self._extract_table_name(sql)
         if not table_name:
             raise ValueError(
-                f"FuzzyMatchStrategy could not determine table name from: {sql}"
+                f"[MySQL] FuzzyMatchStrategy could not determine table name from: {sql}"
             )
 
         # ── 5. Fetch all candidate values from DB ────────────────────────────
@@ -232,14 +270,16 @@ class FuzzyMatchStrategy(BaseStrategy):
 
         if not column_name:
             raise ValueError(
-                f"Could not determine which column to fuzzy-search in '{table_name}'."
+                f"[MySQL] Could not determine which column to fuzzy-search "
+                f"in '{table_name}'."
             )
 
         candidates = self._fetch_mysql_candidates(table_name, column_name)
 
         if not candidates:
             raise ValueError(
-                f"No values found in '{table_name}.{column_name}' to match against."
+                f"[MySQL] No values found in '{table_name}.{column_name}' "
+                "to match against."
             )
 
         # ── 6. Find best Levenshtein match ───────────────────────────────────
@@ -271,7 +311,7 @@ class FuzzyMatchStrategy(BaseStrategy):
         is_valid, error = validator.validate(corrected_sql)
         if not is_valid:
             raise ValueError(
-                f"Corrected SQL blocked by validator: {error}\n"
+                f"[MySQL] Corrected SQL blocked by validator: {error}\n"
                 f"Corrected SQL: {corrected_sql}"
             )
 
@@ -280,7 +320,7 @@ class FuzzyMatchStrategy(BaseStrategy):
             rows = self.adapter.execute_query(corrected_sql, None)
         except Exception as exc:
             raise RuntimeError(
-                f"FuzzyMatchStrategy failed to execute corrected query.\n"
+                f"[MySQL] FuzzyMatchStrategy failed to execute corrected query.\n"
                 f"SQL  : {corrected_sql}\n"
                 f"Error: {exc}"
             ) from exc
@@ -296,7 +336,7 @@ class FuzzyMatchStrategy(BaseStrategy):
                 "search_term": search_term,
                 "best_match": best_match,
                 "distance": best_distance,
-                "top_scores": all_scores[:5],   # top 5 candidates + distances
+                "top_scores": all_scores[:5],
                 "column_searched": column_name,
                 "question": question,
             },
@@ -306,7 +346,8 @@ class FuzzyMatchStrategy(BaseStrategy):
         self, sql: str
     ) -> tuple[str | None, str | None]:
         """
-        Extract the search term and column name from a SQL WHERE clause.
+        MYSQL-SPECIFIC: Extract the search term and column name from a SQL
+        WHERE clause.
 
         Looks for patterns like:
             WHERE name = 'Tolkein'
@@ -342,7 +383,7 @@ class FuzzyMatchStrategy(BaseStrategy):
 
     def _extract_table_name(self, sql: str) -> str | None:
         """
-        Extract the primary table name from a SQL FROM clause.
+        MYSQL-SPECIFIC: Extract the primary table name from a SQL FROM clause.
 
         Handles:
             FROM products
@@ -358,7 +399,7 @@ class FuzzyMatchStrategy(BaseStrategy):
 
     def _infer_text_column(self, table_name: str) -> str | None:
         """
-        Infer which text column to search by inspecting the schema.
+        MYSQL-SPECIFIC: Infer which text column to search by inspecting the schema.
 
         Fetches the schema from the adapter and looks for known text
         column names in priority order (_TEXT_COLUMN_PRIORITIES).
@@ -389,7 +430,7 @@ class FuzzyMatchStrategy(BaseStrategy):
         self, table_name: str, column_name: str
     ) -> list[str]:
         """
-        Fetch all distinct non-null values from a MySQL text column.
+        MYSQL-SPECIFIC: Fetch all distinct non-null values from a MySQL text column.
 
         Returns a list of strings — these are the candidates we compare
         the user's search term against using Levenshtein distance.
@@ -404,7 +445,8 @@ class FuzzyMatchStrategy(BaseStrategy):
             rows = self.adapter.execute_query(fetch_sql, None)
         except Exception as exc:
             raise RuntimeError(
-                f"Failed to fetch candidates from '{table_name}.{column_name}': {exc}"
+                f"[MySQL] Failed to fetch candidates from "
+                f"'{table_name}.{column_name}': {exc}"
             ) from exc
 
         return [
@@ -417,8 +459,8 @@ class FuzzyMatchStrategy(BaseStrategy):
         self, sql: str, original_term: str, corrected_term: str
     ) -> str:
         """
-        Replace the original (possibly misspelled) search term in the SQL
-        with the corrected term found via Levenshtein matching.
+        MYSQL-SPECIFIC: Replace the original (possibly misspelled) search term
+        in the SQL with the corrected term found via Levenshtein matching.
 
         Handles:
             WHERE name = 'Tolkein'       → WHERE name = 'Tolkien'
@@ -446,26 +488,38 @@ class FuzzyMatchStrategy(BaseStrategy):
 
         return sql
 
-    # ── MongoDB execution path ────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # MONGODB EXECUTION PATH
+    # All methods in this section operate on query dicts only.
+    # They are never called when DB_TYPE=mysql.
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _execute_mongo(self, question: str, generated_query: Any) -> StrategyResult:
         """
-        Full fuzzy match pipeline for MongoDB.
+        MONGO-SPECIFIC: Full fuzzy match pipeline for MongoDB.
+
+        The generated_query dict comes parsed from query_service._parse_mongo_json.
+        It has the shape: {"collection": "...", "filter": {...}, "limit": N}
 
         Steps:
-            1. Type-check — must be dict or list
-            2. Validate with MongoValidator
-            3. Extract search term and field name from filter dict
-            4. Fetch all distinct values from that field
-            5. Find best Levenshtein match
-            6. Build corrected filter with best match substituted
-            7. Execute corrected filter
-            8. Return StrategyResult with match metadata
+            1. Type-check — must be a dict
+            2. Validate the query dict with MongoValidator
+            3. Extract "collection" name and "filter" dict separately
+               (the whole dict is NOT passed to _extract_mongo_term_and_field —
+               that function only understands a plain filter dict, not the
+               full LLM output with collection/limit keys)
+            4. Extract search term and field name from the filter dict
+            5. Fetch all distinct values of that field from the collection
+               (using a real find({}) query on the correct collection)
+            6. Find the best Levenshtein match
+            7. Build a corrected query dict — preserving "collection" key
+            8. Execute corrected query via adapter
+            9. Return StrategyResult with match metadata
         """
         # ── 1. Type check ────────────────────────────────────────────────────
-        if not isinstance(generated_query, (dict, list)):
+        if not isinstance(generated_query, dict):
             raise ValueError(
-                f"MongoDB expects a filter dict or pipeline list, "
+                f"[MongoDB] FuzzyMatchStrategy expects a query dict, "
                 f"got {type(generated_query).__name__}."
             )
 
@@ -473,32 +527,59 @@ class FuzzyMatchStrategy(BaseStrategy):
         validator = get_validator("mongo")
         is_valid, error = validator.validate(generated_query)
         if not is_valid:
-            raise ValueError(f"Query blocked by validator: {error}")
+            raise ValueError(f"[MongoDB] Query blocked by validator: {error}")
 
-        # ── 3. Extract search term and field ─────────────────────────────────
-        filter_dict = (
-            generated_query
-            if isinstance(generated_query, dict)
-            else self._extract_mongo_match_stage(generated_query)
-        )
+        # ── 3. Extract collection and filter ─────────────────────────────────
+        #
+        # CRITICAL: do NOT pass the full LLM dict to _extract_mongo_term_and_field.
+        # That function expects a plain filter like {"name": "Tolkein"}, NOT the
+        # full LLM output {"collection": "books", "filter": {...}, "limit": 20}.
+        # We must extract the "filter" portion first.
+        #
+        collection_name = generated_query.get("collection")
+        if not collection_name:
+            raise ValueError(
+                "[MongoDB] Query dict missing required 'collection' key.\n"
+                f"Got keys: {list(generated_query.keys())}"
+            )
 
+        limit = int(generated_query.get("limit", 20))
+
+        # For pipeline queries, pull the filter from the first $match stage
+        if "pipeline" in generated_query:
+            filter_dict = self._extract_mongo_match_stage(
+                generated_query["pipeline"]
+            )
+        else:
+            filter_dict = generated_query.get("filter", {})
+
+        # ── 4. Extract search term and field from the filter ─────────────────
         search_term, field_name = self._extract_mongo_term_and_field(filter_dict)
 
         if not search_term or not field_name:
             raise ValueError(
-                f"FuzzyMatchStrategy could not extract a search term from: "
-                f"{generated_query}"
+                f"[MongoDB] FuzzyMatchStrategy could not extract a search term "
+                f"from filter: {filter_dict}\n"
+                f"Full query: {generated_query}"
             )
 
-        # ── 4. Fetch all candidate values ────────────────────────────────────
-        candidates = self._fetch_mongo_candidates(field_name)
+        # ── 5. Fetch all candidate values from the collection ─────────────────
+        #
+        # PREVIOUS BUG: used {"_fuzzy_candidates_field": field_name} —
+        # a fictional protocol the adapter never understood → always crashed.
+        #
+        # FIX: run a real find({}) on the correct collection and extract
+        # distinct values for the target field from the results.
+        #
+        candidates = self._fetch_mongo_candidates(collection_name, field_name)
 
         if not candidates:
             raise ValueError(
-                f"No values found in field '{field_name}' to match against."
+                f"[MongoDB] No values found in field '{field_name}' of "
+                f"collection '{collection_name}' to match against."
             )
 
-        # ── 5. Find best match ───────────────────────────────────────────────
+        # ── 6. Find best Levenshtein match ───────────────────────────────────
         best_match, best_distance, all_scores = self._find_best_match(
             search_term, candidates
         )
@@ -506,7 +587,7 @@ class FuzzyMatchStrategy(BaseStrategy):
         if best_match is None:
             return StrategyResult(
                 rows=[],
-                query_used=str(generated_query),
+                query_used=json.dumps(generated_query, ensure_ascii=False),
                 strategy_name=self.strategy_name,
                 row_count=0,
                 metadata={
@@ -514,30 +595,38 @@ class FuzzyMatchStrategy(BaseStrategy):
                     "best_match": None,
                     "distance": None,
                     "message": f"No match within distance {self.max_distance}",
+                    "collection": collection_name,
+                    "field_searched": field_name,
                     "question": question,
                 },
             )
 
-        # ── 6. Build corrected filter ────────────────────────────────────────
+        # ── 7. Build corrected query — preserving "collection" key ────────────
         corrected_filter = self._substitute_mongo_term(
             filter_dict, field_name, best_match
         )
+        corrected_query = {
+            "collection": collection_name,
+            "filter": corrected_filter,
+            "limit": limit,
+        }
 
-        # ── 7. Execute corrected filter ──────────────────────────────────────
+        # ── 8. Execute corrected query ────────────────────────────────────────
         try:
-            rows = self.adapter.execute_query(corrected_filter, None)
+            rows = self.adapter.execute_query(corrected_query, None)
         except Exception as exc:
             raise RuntimeError(
-                f"FuzzyMatchStrategy (Mongo) failed to execute corrected filter.\n"
-                f"Filter: {corrected_filter}\n"
+                f"[MongoDB] FuzzyMatchStrategy failed to execute corrected query.\n"
+                f"Query : {json.dumps(corrected_query, ensure_ascii=False, default=str)}\n"
                 f"Error : {exc}"
             ) from exc
 
         rows = rows[: self._settings.MAX_RESULT_ROWS]
 
+        # ── 9. Return ────────────────────────────────────────────────────────
         return StrategyResult(
             rows=rows,
-            query_used=str(corrected_filter),
+            query_used=json.dumps(corrected_query, ensure_ascii=False, indent=2),
             strategy_name=self.strategy_name,
             row_count=len(rows),
             metadata={
@@ -545,6 +634,7 @@ class FuzzyMatchStrategy(BaseStrategy):
                 "best_match": best_match,
                 "distance": best_distance,
                 "top_scores": all_scores[:5],
+                "collection": collection_name,
                 "field_searched": field_name,
                 "question": question,
             },
@@ -552,7 +642,7 @@ class FuzzyMatchStrategy(BaseStrategy):
 
     def _extract_mongo_match_stage(self, pipeline: list) -> dict:
         """
-        Extract the first $match stage from an aggregation pipeline.
+        MONGO-SPECIFIC: Extract the first $match stage from an aggregation pipeline.
         Returns empty dict if no $match stage found.
         """
         for stage in pipeline:
@@ -564,7 +654,8 @@ class FuzzyMatchStrategy(BaseStrategy):
         self, filter_dict: dict
     ) -> tuple[str | None, str | None]:
         """
-        Extract the search term and field name from a MongoDB filter dict.
+        MONGO-SPECIFIC: Extract the search term and field name from a plain
+        MongoDB filter dict (NOT the full LLM dict — just the "filter" portion).
 
         Handles these patterns:
             {"name": "Tolkein"}                     → ("Tolkein", "name")
@@ -595,7 +686,7 @@ class FuzzyMatchStrategy(BaseStrategy):
 
     def _extract_string_value(self, value: Any) -> str | None:
         """
-        Pull a plain string out of a filter value.
+        MONGO-SPECIFIC: Pull a plain string out of a filter value.
 
         Handles:
             "Tolkein"                  → "Tolkein"
@@ -612,38 +703,65 @@ class FuzzyMatchStrategy(BaseStrategy):
 
         return None
 
-    def _fetch_mongo_candidates(self, field_name: str) -> list[str]:
+    def _fetch_mongo_candidates(
+        self, collection_name: str, field_name: str
+    ) -> list[str]:
         """
-        Fetch all distinct non-null string values for a MongoDB field.
+        MONGO-SPECIFIC: Fetch all distinct non-null string values for a field
+        in a MongoDB collection.
 
-        Uses a Mongo distinct-style query — the adapter must support
-        {"$distinct": field_name} or equivalent. Falls back to fetching
-        all documents and extracting field values manually.
+        Runs a real find({}) on the correct collection and extracts unique
+        values for the target field.
+
+        NOTE ON PREVIOUS BUG:
+            The old implementation used:
+                adapter.execute_query({"_fuzzy_candidates_field": field_name}, None)
+            This was a fictional protocol — the adapter's execute_query()
+            requires a "collection" key and raises ValueError without it.
+            EVERY fuzzy MongoDB query used to crash here.
+
+        FIX:
+            Run a real find({}) on the correct collection (with a high limit)
+            and extract distinct field values from the results.
         """
         try:
-            # Ask adapter for all documents and extract field values
-            # The adapter handles the actual Mongo driver call
+            # Fetch up to 1000 documents from the collection to gather candidates.
+            # A $group aggregation would be cleaner but this works without
+            # requiring the LLM to know the distinct command.
             rows = self.adapter.execute_query(
-                {"_fuzzy_candidates_field": field_name}, None
+                {
+                    "collection": collection_name,
+                    "filter": {},
+                    "limit": 1000,
+                },
+                None,
             )
-            return [
-                str(row[field_name])
-                for row in rows
-                if row.get(field_name) and isinstance(row[field_name], str)
-            ]
         except Exception as exc:
             raise RuntimeError(
-                f"Failed to fetch Mongo candidates for field '{field_name}': {exc}"
+                f"[MongoDB] Failed to fetch fuzzy candidates for field "
+                f"'{field_name}' from collection '{collection_name}': {exc}"
             ) from exc
+
+        # Extract unique string values for the target field
+        seen: set[str] = set()
+        candidates: list[str] = []
+        for row in rows:
+            value = row.get(field_name)
+            if value is not None and isinstance(value, str) and value not in seen:
+                seen.add(value)
+                candidates.append(value)
+
+        return candidates
 
     def _substitute_mongo_term(
         self, filter_dict: dict, field_name: str, corrected_term: str
     ) -> dict:
         """
-        Replace the search term in a MongoDB filter dict with the
-        corrected (best-match) term.
+        MONGO-SPECIFIC: Replace the search term in a MongoDB filter dict
+        with the corrected (best-match) term.
 
-        Returns a new dict — does not mutate the original.
+        Returns a new dict — does NOT mutate the original.
+        Only operates on the filter portion, not the full LLM dict.
         """
         corrected = dict(filter_dict)
         original_value = corrected.get(field_name)
@@ -660,7 +778,10 @@ class FuzzyMatchStrategy(BaseStrategy):
 
         return corrected
 
-    # ── Shared Levenshtein logic (used by both MySQL and Mongo) ───────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # SHARED LEVENSHTEIN LOGIC
+    # Used by both MySQL and MongoDB paths — no DB-specific logic here.
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _find_best_match(
         self,
@@ -668,7 +789,7 @@ class FuzzyMatchStrategy(BaseStrategy):
         candidates: list[str],
     ) -> tuple[str | None, int | None, list[dict]]:
         """
-        Find the candidate with the smallest Levenshtein distance to
+        SHARED: Find the candidate with the smallest Levenshtein distance to
         the search term, within self.max_distance tolerance.
 
         Matching is case-insensitive — both term and candidates are

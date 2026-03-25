@@ -23,7 +23,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // On mount, restore token from localStorage and verify with /api/auth/me
   useEffect(() => {
     const storedToken = localStorage.getItem(TOKEN_KEY)
-    if (!storedToken) {
+    if (!storedToken || storedToken === 'undefined') {
+      localStorage.removeItem(TOKEN_KEY)
       setIsLoading(false)
       return
     }
@@ -57,10 +58,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const data = await res.json()
     if (!res.ok) throw new Error(data.detail || 'Login failed')
     setUser(data.user)
+  if(data.token) {
     setToken(data.token)
     localStorage.setItem(TOKEN_KEY, data.token)
   }
-
+  }
   const signup = async (email: string, password: string, name: string) => {
     const res = await fetch('/api/auth/signup', {
       method: 'POST',
@@ -70,9 +72,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const data = await res.json()
     if (!res.ok) throw new Error(data.detail || 'Signup failed')
     setUser(data.user)
+  if(data.token) {
     setToken(data.token)
     localStorage.setItem(TOKEN_KEY, data.token)
   }
+}
 
   const logout = async () => {
     await fetch('/api/auth/logout', {
