@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     # ── Embedder ─────────────────────────────────────────────────────────────
     # Converts schema text and questions into vectors for RAG similarity search.
     # nomic runs locally through Ollama — same server as the LLM, no extra setup.
-    EMBEDDER_PROVIDER: str = "nomic"      # nomic | cohere
+    EMBEDDER_PROVIDER: str = "nomic"      # nomic | cohere |gemma
 
     # nomic-embed-text (default) — local via Ollama, free, 768 dims
     # Pull with: ollama pull nomic-embed-text
@@ -48,6 +48,8 @@ class Settings(BaseSettings):
     # Cohere (cloud alternative) — needs API key, 1024 dims
     COHERE_API_KEY: str = ""
     COHERE_EMBEDDING_MODEL: str = "embed-english-v3.0"
+    # EmbeddingGemma (Hugging Face) — needs HF token, 768 dims
+    HF_TOKEN: str = ""  # Hugging Face token for gated models
 
     # ── Database ─────────────────────────────────────────────────────────────
     DB_TYPE: str = "mysql"                # mysql | mongo

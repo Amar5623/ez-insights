@@ -16,6 +16,7 @@ def create_embedder() -> BaseEmbedder:
     Options:
       nomic  → NomicEmbedder  (default — local via Ollama, free, 768 dims)
       cohere → CohereEmbedder (cloud, 1024 dims, needs COHERE_API_KEY)
+      gemma  → EmbeddingGemmaEmbedder (Hugging Face, 768 dims, needs HF_TOKEN)
     """
     provider = get_settings().EMBEDDER_PROVIDER.lower()
 
@@ -27,7 +28,11 @@ def create_embedder() -> BaseEmbedder:
         from rag.embedders.cohere_embedder import CohereEmbedder
         return CohereEmbedder()
 
+    if provider == "gemma":
+        from rag.embedders.gemma_embedder import EmbeddingGemmaEmbedder
+        return EmbeddingGemmaEmbedder()
+
     raise ValueError(
         f"Unknown EMBEDDER_PROVIDER='{provider}'. "
-        "Valid options: nomic | cohere"
+        "Valid options: nomic | cohere | gemma"
     )
