@@ -115,11 +115,15 @@ class Settings(BaseSettings):
     API_KEY: str = "change-me-in-env"
     CORS_ORIGINS: list[str] = ["http://localhost:5173"]
 
+    INTENT_CLASSIFIER_ENABLED: bool = True
+    INTENT_LLM_FALLBACK: bool = True
+
     # ── Sensitive Data Masking───────────────────────────────────────────────────────────────
     SENSITIVE_COLUMNS_EXTRA: list[str] = []
     # session
     APP_MONGO_URI: str = "mongodb+srv://..."   # same cluster, different DB is fine
     APP_MONGO_DB_NAME: str = "ez_insights_data"
+      
     class Config:
         env_file = ".env"
         env_file_encoding = "utf-8"
