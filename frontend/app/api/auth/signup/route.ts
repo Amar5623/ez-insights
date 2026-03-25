@@ -33,11 +33,12 @@ export async function POST(req: NextRequest) {
 
     // Sign JWT & set cookie
     const token = await signToken({ id: userId, email: email.toLowerCase(), name: name.trim() })
-    await setSessionCookie(token)
+await setSessionCookie(token)
 
-    return NextResponse.json({
-      user: { id: userId, email: email.toLowerCase(), name: name.trim() },
-    }, { status: 201 })
+return NextResponse.json({
+  user: { id: userId, email: email.toLowerCase(), name: name.trim() },
+  token,   // ← ADD THIS
+}, { status: 201 })
 
   } catch (err) {
     if (err instanceof MongoServerError && err.code === 11000) {
