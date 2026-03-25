@@ -1,15 +1,18 @@
 """Dev 3 owns this file."""
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Header
 from api.schemas import QueryRequest, QueryResponse
 from api.dependencies import get_query_service
 from api.routes.history import append_to_history
 from services.query_service import QueryService
+
 from services.intent_classifier import classify, IntentType
 from core.config.settings import get_settings
+from core.db.mongo_data import get_data_db
 
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Optional
 
 router = APIRouter()
 
@@ -19,12 +22,16 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
+
 @router.post("/query", response_model=QueryResponse)
 async def run_query(
     body: QueryRequest,
     service: QueryService = Depends(get_query_service),
+    x_chat_id: Optional[str] = Header(default=None),
+    x_user_id: Optional[str] = Header(default=None),
 ):
     question = body.question
+    now = datetime.now(timezone.utc)
 
     # ---------------------------
     # Intent Classification
@@ -36,7 +43,7 @@ async def run_query(
                 llm=service.llm,
                 use_llm_fallback=settings.INTENT_LLM_FALLBACK,
             )
-        except Exception as e:
+        except Exception:
             logger.exception("Intent classification failed")
             intent = IntentType.AMBIGUOUS
     else:
@@ -46,6 +53,9 @@ async def run_query(
 
     # ---------------------------
     # Conversational Handling
+    # (GREETING, CHAT, HELP, FAREWELL)
+    # No DB query is executed — LLM answers directly.
+    # MongoDB persistence is skipped for conversational turns.
     # ---------------------------
     if intent in {
         IntentType.GREETING,
@@ -59,19 +69,11 @@ async def run_query(
         )
 
         try:
-            llm = service.llm
-
-            if llm is not None:
-                answer = llm.generate(conversational_prompt)
-            else:
-                logger.warning("LLM not available for conversational response")
-                answer = "I'm here to help! What would you like to know?"
-
+            answer = service.llm.generate(conversational_prompt)
         except Exception:
             logger.exception("Conversational LLM call failed")
             answer = "I'm here to help! Let me know what you need."
 
-        # ✅ Proper structured response
         result = QueryResponse(
             question=question,
             sql="",
@@ -89,21 +91,24 @@ async def run_query(
             "strategy_used": "INTENT_CHAT",
             "row_count": 0,
             "answer": answer,
-            "created_at": datetime.utcnow(),
+            "created_at": now,
         })
 
         return result
 
     # ---------------------------
     # Database Query Handling
+    # Context window is passed so the LLM can reference prior turns.
+    # Results are persisted to MongoDB when chat headers are present.
     # ---------------------------
     if intent == IntentType.DB_QUERY:
-        result = service.run(question)
+        result = service.run(question, context=body.context or [])
 
         if result.error:
             logger.error(f"QueryService error: {result.error}")
             raise HTTPException(status_code=500, detail=result.error)
 
+        # Keep existing in-memory history (backward compat)
         append_to_history({
             "id": str(uuid.uuid4()),
             "question": result.question,
@@ -111,22 +116,65 @@ async def run_query(
             "strategy_used": result.strategy_used,
             "row_count": result.row_count,
             "answer": result.answer,
-            "created_at": datetime.utcnow(),
+            "created_at": now,
         })
+
+        # Persist to MongoDB if frontend sent chat context headers
+        if x_chat_id and x_user_id:
+            try:
+                db = get_data_db()
+                db["messages"].insert_many([
+                    {
+                        "_id": str(uuid.uuid4()),
+                        "chat_id": x_chat_id,
+                        "user_id": x_user_id,
+                        "role": "user",
+                        "question": question,
+                        "created_at": now,
+                    },
+                    {
+                        "_id": str(uuid.uuid4()),
+                        "chat_id": x_chat_id,
+                        "user_id": x_user_id,
+                        "role": "assistant",
+                        "question": question,
+                        "sql": result.sql,
+                        "answer": result.answer,
+                        "strategy_used": result.strategy_used,
+                        "row_count": result.row_count,
+                        "created_at": now,
+                    },
+                ])
+                db["chats"].update_one(
+                    {"_id": x_chat_id},
+                    {"$set": {"updated_at": now}},
+                )
+            except Exception as e:
+                # Never fail the query response because of a persistence error
+                logger.warning(f"[query] Failed to persist messages: {e}")
 
         return result
 
     # ---------------------------
     # Ambiguous Handling
+    # Intent could not be classified confidently.
+    # No DB query is executed — ask the user to clarify.
     # ---------------------------
     logger.warning(f"Ambiguous intent for question: {question}")
 
-    answer = "I'm not sure if this is a database-related request. Could you please clarify?"
+    answer = (
+        "I'm not sure if this is a database-related request. "
+        "Could you please clarify?"
+    )
 
     result = QueryResponse(
-        answer=answer,
+        question=question,
         sql="",
         results=[],
+        row_count=0,
+        strategy_used="INTENT_AMBIGUOUS",
+        answer=answer,
+        error=None,
     )
 
     append_to_history({
@@ -136,7 +184,7 @@ async def run_query(
         "strategy_used": "INTENT_AMBIGUOUS",
         "row_count": 0,
         "answer": answer,
-        "created_at": datetime.utcnow(),
+        "created_at": now,
     })
 
     return result

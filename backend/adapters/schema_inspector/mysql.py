@@ -1,4 +1,6 @@
 from typing import Any
+import logging
+from core.config.settings import get_settings
 
 
 def inspect_mysql_schema(connection: Any) -> dict:
@@ -22,30 +24,94 @@ def inspect_mysql_schema(connection: Any) -> dict:
 
     schema = {}
 
+    # Layer 2 — blocked columns
+    blocked = _get_all_blocked_columns()
+
+    # Tables that MUST use safe views
+    SENSITIVE_TABLES = {"customers", "payments"}
+
     with connection.cursor() as cursor:
 
-        # Step 1 — get all table names
-        # SHOW TABLES returns one row per table
-        # DictCursor gives: {"Tables_in_nlsql_db": "books"}
-        # we use list(row.values())[0] to grab the name
-        # regardless of what the database is called
         cursor.execute("SHOW TABLES")
         tables = [list(row.values())[0] for row in cursor.fetchall()]
 
-        # Step 2 — for each table get its columns
         for table in tables:
+
+            # If it's a sensitive table → skip raw table
+            if table in SENSITIVE_TABLES:
+                continue
+
+            # If it's a safe view OR normal table → allow
             cursor.execute(f"DESCRIBE `{table}`")
             rows = cursor.fetchall()
 
-            # DESCRIBE returns one row per column like:
-            # {"Field": "id", "Type": "int(11)", "Null": "NO", ...}
             schema[table] = [
                 {
-                    "column":   row["Field"],           # column name
-                    "type":     row["Type"],             # e.g. int(11), varchar(255)
-                    "nullable": row["Null"] == "YES",    # "YES" → True, "NO" → False
+                    "column": row["Field"],
+                    "type": row["Type"],
+                    "nullable": row["Null"] == "YES",
                 }
                 for row in rows
+                if row["Field"].lower() not in blocked   #column filter
             ]
 
     return schema
+
+# ─── Built-in sensitive column names ─────────────────────────────────────────
+# These are ALWAYS filtered regardless of settings.
+# Column names are compared lowercase so casing in the DB doesn't matter.
+
+SENSITIVE_COLUMNS: frozenset[str] = frozenset({
+    # ── From your actual schema (customers + payments tables) ─────────────────
+    "upi_id",           # UPI payment identifier
+    "account_number",   # bank account number
+    "ifsc_code",        # bank routing/IFSC code
+    "card_number",      # payment card number
+    "cvv",              # card security code
+    "card_expiry",       # card expiry date
+    "creditLimit",       # credit limit for customers
+    "checkNumber"        # check number for payments
+
+    # ── Generic sensitive names (kept for future tables) ──────────────────────
+    "cvv2",
+    "cvc",
+    "card_pin",
+    "card_expiry_date",
+    "bank_account",
+    "routing_number",
+    "iban",
+    "swift_code",
+    "ssn",
+    "social_security_number",
+    "national_id",
+    "passport_number",
+    "tax_id",
+    "ein",
+    "password",
+    "password_hash",
+    "hashed_password",
+    "pin",
+    "secret",
+    "private_key",
+    "secret_key",
+    "api_key",
+    "api_secret",
+    "token",
+    "access_token",
+    "refresh_token",
+    "salt",
+    "pepper",
+    "date_of_birth",
+    "dob",
+    "biometric_data",
+    "fingerprint",
+})
+
+
+def _get_all_blocked_columns() -> frozenset[str]:
+    """
+    Combine built-in SENSITIVE_COLUMNS with any extras from settings.
+    Called fresh each time so .env changes take effect on restart.
+    """
+    extras = {col.lower() for col in get_settings().SENSITIVE_COLUMNS_EXTRA}
+    return SENSITIVE_COLUMNS | extras

@@ -176,7 +176,7 @@ export function ChatSidebar({ isOpen, onToggle }: ChatSidebarProps) {
               <Button
                 variant="ghost"
                 size="icon"
-                onClick={logout}
+                onClick={() => logout()}
                 className="h-8 w-8 shrink-0 rounded-lg transition-all duration-200 hover:bg-destructive/10 hover:text-destructive active:scale-90"
                 title="Sign out"
               >
