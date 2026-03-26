@@ -9,7 +9,7 @@ export interface QueryRequest {
 export interface QueryResponse {
   question: string
   sql: string
-  results: Record<string, unknown>[]
+  results?: Record<string, unknown>[]  // optional now
   row_count: number
   strategy_used: string
   answer: string

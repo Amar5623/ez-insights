@@ -45,18 +45,61 @@ async function fetchWithAuth(endpoint: string, options: RequestInit = {}) {
 
 // ── Query API ─────────────────────────────────────────────────────────────────
 
-export async function sendQuery(request: QueryRequest): Promise<QueryResponse> {
-  const headers: Record<string, string> = {}
-
-  // Pass active chat context so backend can auto-persist messages
+export async function sendQuery(
+  request: QueryRequest,
+  onChunk: (chunk: string) => void,
+  onDone: (meta: Partial<QueryResponse>) => void,
+  onError: (err: string) => void,
+): Promise<void> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    'X-API-Key': API_KEY,
+  }
+  if (_jwtToken) headers['Authorization'] = `Bearer ${_jwtToken}`
   if (_activeChatId) headers['X-Chat-Id'] = _activeChatId
   if (_activeUserId) headers['X-User-Id'] = _activeUserId
 
-  return fetchWithAuth('/api/query', {
+  const response = await fetch(`${API_URL}/api/query`, {
     method: 'POST',
     headers,
     body: JSON.stringify(request),
   })
+
+  if (!response.ok || !response.body) {
+    const err = await response.json().catch(() => ({ detail: 'Request failed' }))
+    onError(err.detail || `HTTP ${response.status}`)
+    return
+  }
+
+  const reader = response.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buffer += decoder.decode(value, { stream: true })
+
+    const lines = buffer.split('\n')
+    buffer = lines.pop() ?? ''
+
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue
+      const raw = line.slice(6).trim()
+      if (!raw) continue
+      try {
+        const event = JSON.parse(raw)
+        if (event.status === 'thinking') continue
+        if (event.chunk !== undefined) {
+          onChunk(event.chunk)
+        } else if (event.done && !event.chunk) {
+          onDone(event)
+        }
+      } catch {
+        // ignore malformed
+      }
+    }
+  }
 }
 
 // ── History API (legacy) ──────────────────────────────────────────────────────

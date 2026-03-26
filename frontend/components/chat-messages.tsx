@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef } from 'react'
 import { useChat } from '@/lib/chat-context'
 import type { ChatMessage } from '@/lib/types'
 import { cn } from '@/lib/utils'
@@ -15,94 +15,23 @@ import * as ScrollAreaPrimitive from '@radix-ui/react-scroll-area'
 import {
   UserIcon,
   BotIcon,
-  CodeIcon,
-  TableIcon,
-  ChevronDownIcon,
+  CodeIcon, 
   SparklesIcon,
   ZapIcon,
-  ChevronDownIcon as ChevronIcon,
+  ChevronDownIcon
 } from 'lucide-react'
+
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 const PAGE_SIZE = 10
-
-// ── ResultTable ────────────────────────────────────────────────────────────────
-// Replaces the old static slice(0,10) + "Showing X of Y" text.
-// Keeps all fetched rows in memory — no re-fetch on "Show more".
-function ResultTable({
-  results,
-  rowCount,
-}: {
-  results: Record<string, unknown>[]
-  rowCount: number
-}) {
-  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE)
-
-  const displayed  = results.slice(0, visibleCount)
-  const remaining  = results.length - visibleCount
-  const columns    = Object.keys(results[0])
-
-  return (
-    <div className="overflow-hidden rounded-xl border border-border shadow-sm">
-      <div className="overflow-x-auto">
-        <table className="w-full text-xs">
-          <thead>
-            <tr className="border-b border-border bg-muted/70">
-              {columns.map((col) => (
-                <th
-                  key={col}
-                  className="whitespace-nowrap px-4 py-3 text-left font-semibold text-foreground"
-                >
-                  {col}
-                </th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {displayed.map((row, i) => (
-              <tr
-                key={i}
-                className="border-b border-border/50 last:border-0 transition-colors hover:bg-muted/30"
-              >
-                {Object.values(row).map((val, j) => (
-                  <td
-                    key={j}
-                    className="whitespace-nowrap px-4 py-2.5 text-muted-foreground"
-                  >
-                    {String(val ?? '')}
-                  </td>
-                ))}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-
-      {/* Footer: row count summary + Show more button */}
-      <div className="flex items-center justify-between border-t border-border bg-muted/30 px-4 py-2">
-        <span className="text-xs text-muted-foreground">
-          Showing {Math.min(visibleCount, results.length)} of {rowCount} rows
-        </span>
-
-        {remaining > 0 && (
-          <button
-            onClick={() => setVisibleCount((v) => v + PAGE_SIZE)}
-            className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-primary transition-colors hover:bg-primary/10"
-          >
-            <ChevronIcon className="h-3 w-3" />
-            Show {Math.min(PAGE_SIZE, remaining)} more
-          </button>
-        )}
-      </div>
-    </div>
-  )
-}
-
+       
 // ── LoadingBubble ──────────────────────────────────────────────────────────────
 function LoadingBubble() {
   return (
     <div className="flex gap-3 animate-fade-in">
-      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-primary/20 to-primary/10 ring-2 ring-primary/20">
+      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-linear-to-br from-primary/20 to-primary/10 ring-2 ring-primary/20">
         <BotIcon className="h-4 w-4 text-primary animate-pulse-subtle" />
       </div>
       <div className="flex-1 space-y-3 py-1">
@@ -139,7 +68,7 @@ function MessageBubble({ message, index }: { message: ChatMessage; index: number
           'flex h-9 w-9 shrink-0 items-center justify-center rounded-xl transition-transform duration-300 hover:scale-105',
           isUser
             ? 'bg-primary shadow-md shadow-primary/25'
-            : 'bg-gradient-to-br from-primary/20 to-primary/10 ring-2 ring-primary/20'
+            : 'bg-linear-to-br from-primary/20 to-primary/10 ring-2 ring-primary/20'
         )}
       >
         {isUser ? (
@@ -156,17 +85,31 @@ function MessageBubble({ message, index }: { message: ChatMessage; index: number
         )}
       >
         <div
-          className={cn(
-            'rounded-2xl px-4 py-3 shadow-sm transition-all duration-300',
-            isUser
-              ? 'bg-primary text-primary-foreground shadow-primary/20'
-              : 'bg-card border border-border text-foreground'
-          )}
-        >
-          <p className="whitespace-pre-wrap text-sm leading-relaxed">
-            {message.content}
-          </p>
-        </div>
+  className={cn(
+    'rounded-2xl px-4 py-3 shadow-sm transition-all duration-300',
+    isUser
+      ? 'bg-primary text-primary-foreground shadow-primary/20'
+      : 'bg-card border border-border text-foreground'
+  )}
+>
+  {isUser ? (
+    <p className="whitespace-pre-wrap text-sm leading-relaxed">
+      {message.content}
+    </p>
+  ) : (
+    <div className="prose prose-sm dark:prose-invert max-w-none
+      prose-table:w-full prose-table:text-xs
+      prose-th:px-3 prose-th:py-2 prose-th:text-left prose-th:font-semibold prose-th:border prose-th:border-border
+      prose-td:px-3 prose-td:py-2 prose-td:border prose-td:border-border prose-td:text-muted-foreground
+      prose-thead:bg-muted/70 prose-tr:transition-colors hover:prose-tr:bg-muted/30
+      prose-p:leading-relaxed prose-p:text-sm prose-p:my-1
+      prose-strong:text-foreground prose-code:text-xs prose-code:bg-muted prose-code:px-1 prose-code:rounded">
+      <ReactMarkdown remarkPlugins={[remarkGfm]}>
+        {message.content}
+      </ReactMarkdown>
+    </div>
+  )}
+</div>
 
         {/* SQL Preview — unchanged */}
         {message.sql && (
@@ -180,23 +123,6 @@ function MessageBubble({ message, index }: { message: ChatMessage; index: number
               <pre className="overflow-x-auto rounded-xl border border-border bg-muted/50 p-4 text-xs font-mono">
                 <code className="text-foreground">{message.sql}</code>
               </pre>
-            </CollapsibleContent>
-          </Collapsible>
-        )}
-
-        {/* Results Table — now uses ResultTable with pagination */}
-        {message.results && message.results.length > 0 && (
-          <Collapsible className="w-full animate-scale-in animation-delay-100">
-            <CollapsibleTrigger className="flex items-center gap-2 rounded-lg px-3 py-1.5 text-xs text-muted-foreground transition-all duration-200 hover:bg-muted hover:text-foreground">
-              <TableIcon className="h-3.5 w-3.5" />
-              <span>View Results ({message.row_count} rows)</span>
-              <ChevronDownIcon className="h-3.5 w-3.5 transition-transform duration-200 group-data-[state=open]:rotate-180" />
-            </CollapsibleTrigger>
-            <CollapsibleContent className="mt-2 animate-fade-in">
-              <ResultTable
-                results={message.results}
-                rowCount={message.row_count ?? message.results.length}
-              />
             </CollapsibleContent>
           </Collapsible>
         )}
@@ -224,7 +150,7 @@ function MessageBubble({ message, index }: { message: ChatMessage; index: number
 }
 
 // ── ChatMessages ───────────────────────────────────────────────────────────────
-export function ChatMessages({ sidebarOpen }: { sidebarOpen: boolean }) {
+export function   ChatMessages({ sidebarOpen }: { sidebarOpen: boolean }) {
   const { currentChat, isLoading, sendMessage } = useChat()
   // FIX: Direct ref to the Radix ScrollArea Viewport so we can imperatively
   // set scrollTop — avoids the scrollIntoView-on-wrong-ancestor bug.
@@ -259,7 +185,7 @@ export function ChatMessages({ sidebarOpen }: { sidebarOpen: boolean }) {
     return (
       <div className="flex flex-1 items-center justify-center p-8">
         <div className="max-w-md text-center animate-fade-in-up">
-          <div className="mx-auto mb-6 flex h-20 w-20 items-center justify-center rounded-3xl bg-gradient-to-br from-primary/20 to-primary/5 ring-4 ring-primary/10 shadow-lg shadow-primary/10">
+          <div className="mx-auto mb-6 flex h-20 w-20 items-center justify-center rounded-3xl bg-linear-to-br from-primary/20 to-primary/5 ring-4 ring-primary/10 shadow-lg shadow-primary/10">
             <BotIcon className="h-10 w-10 text-primary" />
           </div>
           <h2 className="mb-3 text-2xl font-semibold text-foreground">
@@ -293,7 +219,7 @@ export function ChatMessages({ sidebarOpen }: { sidebarOpen: boolean }) {
       {/* Sticky header — logo + name only */}
       {!sidebarOpen && (
         <div className="flex items-center gap-3 border-b border-border px-6 py-3 bg-background/80 backdrop-blur-sm animate-fade-in">
-          <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-gradient-to-br from-primary/20 to-primary/5 ring-2 ring-primary/10">
+          <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-linear-to-br from-primary/20 to-primary/5 ring-2 ring-primary/10">
             <BotIcon className="h-4 w-4 text-primary" />
           </div>
           <span className="font-semibold text-foreground">Ez-Insights</span>
@@ -309,7 +235,7 @@ export function ChatMessages({ sidebarOpen }: { sidebarOpen: boolean }) {
             ))}
           </div>
         </ScrollAreaPrimitive.Viewport>
-        <ScrollAreaPrimitive.Scrollbar orientation="vertical" className="flex touch-none select-none transition-colors h-full w-2.5 border-l border-l-transparent p-[1px]">
+        <ScrollAreaPrimitive.Scrollbar orientation="vertical" className="flex touch-none select-none transition-colors h-full w-2.5 border-l border-l-transparent p-px">
           <ScrollAreaPrimitive.Thumb className="relative flex-1 rounded-full bg-border" />
         </ScrollAreaPrimitive.Scrollbar>
       </ScrollAreaPrimitive.Root>
