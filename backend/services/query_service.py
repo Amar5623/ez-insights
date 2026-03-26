@@ -193,8 +193,13 @@ class QueryService:
             sql_query=strategy_result.query_used,
             context=context or [],
         )
-        answer = self.llm.generate(answer_prompt)
-
+        # Use generate_with_history so the ClassicModels Analytics Assistant
+        # system prompt is applied as the "system" role.
+        answer = self.llm.generate_with_history([
+            {"role": "system",  "content": answer_prompt["system"]},
+            {"role": "user",    "content": answer_prompt["user"]},
+        ])
+        
         logger.info(
             f"[QueryService] OK | strategy={strategy_result.strategy_name} "
             f"rows={strategy_result.row_count} | question={question!r}"
@@ -231,14 +236,20 @@ class QueryService:
         for attempt in range(1, self._settings.MAX_RETRIES + 1):
 
             # ── Build schema-aware prompt (includes errors from prior attempts)
+            # Returns {"system": ..., "user": ...} — passed as separate roles.
             prompt = self._prompt_builder.build_query_prompt(
                 question=question,
                 schema_chunks=schema_chunks,
                 attempt_history=attempt_history or None,
             )
-
+ 
             # ── LLM generates raw query text ──────────────────────────────────
-            raw_query_text = self.llm.generate(prompt)
+            # Use generate_with_history so the system prompt is injected as the
+            # "system" role, giving the LLM its full behavioural instruction set.
+            raw_query_text = self.llm.generate_with_history([
+                {"role": "system",  "content": prompt["system"]},
+                {"role": "user",    "content": prompt["user"]},
+            ])
             logger.debug(
                 f"[QueryService] Attempt {attempt}/{self._settings.MAX_RETRIES} "
                 f"— raw LLM output: {raw_query_text[:200]!r}"
