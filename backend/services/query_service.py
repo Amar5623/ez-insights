@@ -1,51 +1,44 @@
 """
 services/query_service.py
-Lead owns this file.
 
-Central orchestration layer — the single point that wires together:
-    LLM  →  SchemaRetriever  →  PromptBuilder  →  Strategy  →  DataScrubber
+Orchestrates the full NL → Answer pipeline.
 
-The service is DB-agnostic by design. It does NOT import MySQLAdapter or
-MongoAdapter directly — it receives an injected BaseDBAdapter via __init__.
+PIPELINE FLOW (logged at every step):
+    1.  [INTENT]      → classify question (conversational vs DB query)
+    2.  [SCHEMA_RAG]  → retrieve relevant schema chunks via vector similarity
+    3.  [PROMPT]      → build system+user prompt from question + schema
+    4.  [LLM_CALL]    → LLM generates a raw query (SQL string or Mongo JSON)
+    5.  [PARSE]       → parse LLM output into correct type for DB
+    6.  [STRATEGY]    → execute query via strategy (sql / fuzzy / vector / combined)
+    7.  [DB_EXEC]     → strategy calls adapter.execute_query()
+    8.  [SCRUB]       → mask sensitive values from results
+    9.  [ANSWER]      → LLM generates a human-readable answer from rows
+    10. [PIPELINE]    → full summary: strategy, row count, total latency
 
-──────────────────────────────────────────────────────────────────────────────
-MYSQL vs MONGODB — what this file does differently per DB type
-──────────────────────────────────────────────────────────────────────────────
-
-  MySQL:
-    - LLM returns a plain SQL string
-      e.g. "SELECT * FROM products WHERE price > 100 LIMIT 20"
-    - _parse_query() returns the string as-is
-    - strategy.execute() receives a str
-
-  MongoDB:
-    - LLM returns a JSON string (see MONGO_GENERATION_TEMPLATE in prompt_builder)
-      e.g. '{"collection": "products", "filter": {"price": {"$gt": 100}}, "limit": 20}'
-      or   '{"collection": "sales", "pipeline": [...], "limit": 5}'
-    - _parse_query() calls _parse_mongo_json() to convert the string to a dict
-    - strategy.execute() receives a dict
-    - On parse failure, the retry loop re-prompts the LLM with the error
+MySQL  → str (SQL)
+MongoDB → dict (JSON parsed from LLM output)
 
 This split happens ONCE in _parse_query(). Every strategy and adapter
 downstream receives the correct type and doesn't have to worry about parsing.
-──────────────────────────────────────────────────────────────────────────────
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
 from core.interfaces import BaseLLM, BaseDBAdapter, BaseStrategy
 from core.config.settings import get_settings
+from core.logging_config import get_logger, truncate, log_latency
 from rag.schema_retriever import SchemaRetriever
 from rag.prompt_builder import PromptBuilder
 from services.data_scrubber import scrub_rows
 from strategies.retry_handler import AttemptRecord
 
-logger = logging.getLogger("nlsql.query_service")
+logger = get_logger(__name__)
 
 
 # ─── Custom exception ─────────────────────────────────────────────────────────
@@ -109,31 +102,50 @@ class QueryService:
         self._prompt_builder = PromptBuilder(adapter)
         self._settings = get_settings()
 
+        logger.info(
+            f"[PIPELINE] QueryService initialized | "
+            f"llm={llm.provider_name} | "
+            f"db={adapter.db_type} | "
+            f"strategy={strategy.strategy_name}"
+        )
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def run(self, question: str, context: list[dict] | None = None) -> QueryResponse:
         """
         Execute the full pipeline for a natural language question.
 
-        Flow:
-            1. Retrieve relevant schema chunks (vector similarity)
-            2. Build a schema-aware LLM prompt
-            3. LLM generates a query (SQL string for MySQL, JSON dict for MongoDB)
-            4. Parse the LLM output into the correct type (_parse_query)
-            5. Strategy executes the query against the DB
-            6. On failure: build error-aware retry prompt and try again
-            7. Scrub sensitive values from results
-            8. LLM generates a human-readable answer from the rows
-            9. Return QueryResponse
-
         Returns:
             QueryResponse with error=None on success, or error message on failure.
             Never raises — all exceptions are caught and returned as error responses.
         """
+        pipeline_start = time.perf_counter()
+
+        logger.info(
+            f"[PIPELINE] START | "
+            f"question={truncate(question, 120)} | "
+            f"context_turns={len(context) if context else 0}"
+        )
+
         try:
-            return self._run_pipeline(question, context=context)
+            result = self._run_pipeline(question, context=context)
+
+            total_ms = int((time.perf_counter() - pipeline_start) * 1000)
+            logger.info(
+                f"[PIPELINE] COMPLETE | "
+                f"strategy={result.strategy_used} | "
+                f"rows={result.row_count} | "
+                f"total_latency={total_ms}ms | "
+                f"question={truncate(question, 80)}"
+            )
+            return result
+
         except MaxRetriesExceeded as e:
-            logger.warning(f"[QueryService] MaxRetriesExceeded: {e}")
+            total_ms = int((time.perf_counter() - pipeline_start) * 1000)
+            logger.warning(
+                f"[PIPELINE] FAILED — MaxRetriesExceeded | "
+                f"total_latency={total_ms}ms | error={e}"
+            )
             return QueryResponse(
                 question=question,
                 sql="",
@@ -148,8 +160,12 @@ class QueryService:
                 ),
             )
         except Exception as exc:
+            total_ms = int((time.perf_counter() - pipeline_start) * 1000)
             logger.error(
-                f"[QueryService] Unhandled error for question={question!r}: {exc}",
+                f"[PIPELINE] FAILED — Unhandled exception | "
+                f"total_latency={total_ms}ms | "
+                f"question={truncate(question, 80)} | "
+                f"error={exc}",
                 exc_info=True,
             )
             return QueryResponse(
@@ -165,24 +181,37 @@ class QueryService:
     # ── Private pipeline ──────────────────────────────────────────────────────
 
     def _run_pipeline(self, question: str, context: list[dict] | None = None) -> QueryResponse:
-        """
-        Core pipeline — called by run(). Exceptions propagate to run() handler.
-        """
+        """Core pipeline — called by run(). Exceptions propagate to run() handler."""
+
         # ── 1. Retrieve relevant schema chunks ───────────────────────────────
+        t0 = time.perf_counter()
         schema_chunks = self.retriever.retrieve(question)
-        logger.debug(
-            f"[QueryService] Retrieved {len(schema_chunks)} schema chunk(s) "
-            f"for question={question!r}"
+        schema_ms = int((time.perf_counter() - t0) * 1000)
+
+        logger.info(
+            f"[SCHEMA_RAG] Retrieved {len(schema_chunks)} chunk(s) | "
+            f"latency={schema_ms}ms"
         )
+        for i, chunk in enumerate(schema_chunks):
+            logger.debug(
+                f"[SCHEMA_RAG] chunk[{i}] | "
+                f"id={chunk.get('id', '?')} | "
+                f"score={chunk.get('score', 0):.4f} | "
+                f"text={truncate(str(chunk.get('metadata', {}).get('text', '')), 100)}"
+            )
 
         # ── 2–5. Generate query + execute with retry loop ────────────────────
         strategy_result = self._generate_and_execute(question, schema_chunks)
 
         # ── 6. Scrub sensitive data from results ─────────────────────────────
+        t0 = time.perf_counter()
         scrubbed_rows = scrub_rows(strategy_result.rows)
+        scrub_ms = int((time.perf_counter() - t0) * 1000)
+        logger.debug(f"[SCRUB] completed | latency={scrub_ms}ms")
 
         # ── 7. Assess result quality for answer prompt ───────────────────────
         quality = self._assess_result_quality(scrubbed_rows)
+        logger.debug(f"[ANSWER] Result quality assessment: {quality}")
 
         # ── 8. Generate natural language answer ──────────────────────────────
         answer_prompt = self._prompt_builder.build_answer_prompt(
@@ -193,17 +222,26 @@ class QueryService:
             sql_query=strategy_result.query_used,
             context=context or [],
         )
-        # Use generate_with_history so the ClassicModels Analytics Assistant
-        # system prompt is applied as the "system" role.
-        answer = self.llm.generate_with_history([
-            {"role": "system",  "content": answer_prompt["system"]},
-            {"role": "user",    "content": answer_prompt["user"]},
-        ])
-        
-        logger.info(
-            f"[QueryService] OK | strategy={strategy_result.strategy_name} "
-            f"rows={strategy_result.row_count} | question={question!r}"
+
+        logger.debug(
+            f"[ANSWER] Sending answer prompt to LLM | "
+            f"rows_in_prompt={min(len(scrubbed_rows), self._settings.MAX_ROWS_FOR_LLM)} | "
+            f"context_turns={len(context) if context else 0}"
         )
+
+        t0 = time.perf_counter()
+        answer = self.llm.generate_with_history([
+            {"role": "system", "content": answer_prompt["system"]},
+            {"role": "user",   "content": answer_prompt["user"]},
+        ])
+        answer_ms = int((time.perf_counter() - t0) * 1000)
+
+        logger.info(
+            f"[ANSWER] Generated | "
+            f"latency={answer_ms}ms | "
+            f"answer={truncate(answer, 120)}"
+        )
+        logger.debug(f"[ANSWER] Full answer:\n{answer}")
 
         # ── 9. Return ────────────────────────────────────────────────────────
         return QueryResponse(
@@ -232,35 +270,63 @@ class QueryService:
         """
         attempt_history: list[AttemptRecord] = []
         last_exc: Exception | None = None
+        max_attempts = self._settings.MAX_RETRIES
 
-        for attempt in range(1, self._settings.MAX_RETRIES + 1):
+        for attempt in range(1, max_attempts + 1):
 
-            # ── Build schema-aware prompt (includes errors from prior attempts)
-            # Returns {"system": ..., "user": ...} — passed as separate roles.
+            logger.info(
+                f"[LLM_CALL] Attempt {attempt}/{max_attempts} | "
+                f"db_type={self.adapter.db_type}"
+            )
+
+            # ── Build schema-aware prompt ─────────────────────────────────────
+            t0 = time.perf_counter()
             prompt = self._prompt_builder.build_query_prompt(
                 question=question,
                 schema_chunks=schema_chunks,
                 attempt_history=attempt_history or None,
             )
- 
-            # ── LLM generates raw query text ──────────────────────────────────
-            # Use generate_with_history so the system prompt is injected as the
-            # "system" role, giving the LLM its full behavioural instruction set.
-            raw_query_text = self.llm.generate_with_history([
-                {"role": "system",  "content": prompt["system"]},
-                {"role": "user",    "content": prompt["user"]},
-            ])
+            prompt_ms = int((time.perf_counter() - t0) * 1000)
+
             logger.debug(
-                f"[QueryService] Attempt {attempt}/{self._settings.MAX_RETRIES} "
-                f"— raw LLM output: {raw_query_text[:200]!r}"
+                f"[PROMPT] Built | latency={prompt_ms}ms | "
+                f"has_retry_context={bool(attempt_history)}"
             )
+            logger.debug(f"[PROMPT] System:\n{prompt['system']}")
+            logger.debug(f"[PROMPT] User:\n{prompt['user']}")
+
+            # ── LLM generates raw query text ──────────────────────────────────
+            t0 = time.perf_counter()
+            raw_query_text = self.llm.generate_with_history([
+                {"role": "system", "content": prompt["system"]},
+                {"role": "user",   "content": prompt["user"]},
+            ])
+            llm_ms = int((time.perf_counter() - t0) * 1000)
+
+            logger.info(
+                f"[LLM_CALL] Response received | "
+                f"attempt={attempt} | "
+                f"latency={llm_ms}ms | "
+                f"raw_output={truncate(raw_query_text, 150)}"
+            )
+            logger.debug(f"[LLM_CALL] Full raw output:\n{raw_query_text}")
 
             # ── Parse LLM output → correct type for this DB ───────────────────
-            # MySQL  → str (SQL)   |   MongoDB → dict (JSON parsed to dict)
             try:
+                t0 = time.perf_counter()
                 generated_query = self._parse_query(raw_query_text)
+                parse_ms = int((time.perf_counter() - t0) * 1000)
+
+                logger.info(
+                    f"[PARSE] Success | "
+                    f"attempt={attempt} | "
+                    f"db_type={self.adapter.db_type} | "
+                    f"query_type={type(generated_query).__name__} | "
+                    f"latency={parse_ms}ms | "
+                    f"parsed={truncate(str(generated_query), 150)}"
+                )
+
             except ValueError as parse_exc:
-                # JSON parse failure for MongoDB counts as a failed attempt
                 last_exc = parse_exc
                 attempt_history.append(
                     AttemptRecord(
@@ -270,164 +336,164 @@ class QueryService:
                     )
                 )
                 logger.warning(
-                    f"[QueryService] Attempt {attempt} parse error: {parse_exc}"
+                    f"[PARSE] FAILED | "
+                    f"attempt={attempt}/{max_attempts} | "
+                    f"error={parse_exc}"
                 )
-                if attempt == self._settings.MAX_RETRIES:
+                if attempt == max_attempts:
                     raise MaxRetriesExceeded(str(parse_exc)) from parse_exc
                 continue
 
-            # ── Execute strategy ──────────────────────────────────────────────
+            # ── Strategy execution ─────────────────────────────────────────────
             try:
-                result = self.strategy.execute(question, generated_query)
-                logger.debug(
-                    f"[QueryService] Attempt {attempt} succeeded — "
-                    f"strategy={result.strategy_name} rows={result.row_count}"
+                t0 = time.perf_counter()
+                logger.info(
+                    f"[STRATEGY] Executing | "
+                    f"strategy={self.strategy.strategy_name} | "
+                    f"attempt={attempt}"
                 )
-                return result
-            except Exception as exc:
-                last_exc = exc
+
+                strategy_result = self.strategy.execute(question, generated_query)
+                exec_ms = int((time.perf_counter() - t0) * 1000)
+
+                logger.info(
+                    f"[STRATEGY] Success | "
+                    f"strategy={strategy_result.strategy_name} | "
+                    f"rows={strategy_result.row_count} | "
+                    f"latency={exec_ms}ms | "
+                    f"query={truncate(str(strategy_result.query_used), 120)}"
+                )
+                if strategy_result.metadata:
+                    logger.debug(
+                        f"[STRATEGY] Metadata: {strategy_result.metadata}"
+                    )
+
+                return strategy_result
+
+            except Exception as exec_exc:
+                last_exc = exec_exc
                 attempt_history.append(
                     AttemptRecord(
                         attempt_number=attempt,
                         query_used=str(generated_query),
-                        error=str(exc),
+                        error=str(exec_exc),
                     )
                 )
                 logger.warning(
-                    f"[QueryService] Attempt {attempt} execution error: {exc}"
+                    f"[STRATEGY] FAILED | "
+                    f"attempt={attempt}/{max_attempts} | "
+                    f"strategy={self.strategy.strategy_name} | "
+                    f"error={exec_exc}"
                 )
-                if attempt == self._settings.MAX_RETRIES:
-                    raise MaxRetriesExceeded(str(exc)) from exc
+                if attempt == max_attempts:
+                    raise MaxRetriesExceeded(str(exec_exc)) from exec_exc
 
-        # Should never reach here, but satisfy the type checker
+        # Should never reach here — loop always raises or returns
         raise MaxRetriesExceeded(str(last_exc))
 
-    # ── Query parsing — the MySQL / MongoDB split ─────────────────────────────
-
-    def _parse_query(self, raw: str) -> Any:
+    def _parse_query(self, raw_text: str) -> str | dict:
         """
-        Parse the LLM's raw text output into the correct query type.
+        Parse LLM output into the correct type for the current DB.
 
-        ┌──────────┬──────────────────────────────────────────────────────────┐
-        │  MySQL   │  LLM returns a SQL string → returned as-is (stripped)    │
-        │  MongoDB │  LLM returns a JSON string → parsed into a Python dict   │
-        └──────────┴──────────────────────────────────────────────────────────┘
-
-        This is the single point where DB type drives behaviour in this file.
-        Every downstream component (strategy, adapter) receives the correct type
-        and does not need to handle the raw LLM string.
+        MySQL  → returns str (the SQL string, stripped of markdown fences)
+        MongoDB → returns dict (JSON parsed from LLM output)
 
         Raises:
-            ValueError: If the MongoDB JSON cannot be parsed into a valid dict.
+            ValueError: If MongoDB output cannot be parsed as valid JSON.
         """
-        # ── MySQL: return the SQL string unchanged ────────────────────────────
-        if self.adapter.db_type == "mysql":
-            return raw.strip()
+        db_type = self.adapter.db_type
 
-        # ── MongoDB: parse JSON string → Python dict ──────────────────────────
-        return self._parse_mongo_json(raw)
+        if db_type == "mysql":
+            return self._strip_sql(raw_text)
 
-    def _parse_mongo_json(self, raw: str) -> dict:
+        if db_type == "mongo":
+            return self._parse_mongo_json(raw_text)
+
+        raise ValueError(
+            f"_parse_query: unsupported db_type='{db_type}'. "
+            "Expected 'mysql' or 'mongo'."
+        )
+
+    @staticmethod
+    def _strip_sql(raw: str) -> str:
+        """Strip markdown code fences and whitespace from LLM SQL output."""
+        sql = raw.strip()
+        # Remove ```sql ... ``` or ``` ... ``` fences
+        if sql.startswith("```"):
+            lines = sql.split("\n")
+            # Drop first line (```sql or ```) and last line (```)
+            inner = lines[1:] if lines[-1].strip() == "```" else lines[1:]
+            sql = "\n".join(
+                line for line in inner if line.strip() != "```"
+            ).strip()
+        return sql
+
+    @staticmethod
+    def _parse_mongo_json(raw: str) -> dict:
         """
-        Parse the LLM's MongoDB query JSON string into a Python dict.
+        Extract a JSON dict from LLM output.
 
-        The LLM is instructed to return raw JSON (see MONGO_GENERATION_TEMPLATE
-        in prompt_builder.py), but in practice may include:
-          - Markdown code fences: ```json ... ```
-          - Surrounding explanation text
-          - Slightly malformed JSON (trailing commas, single quotes)
-
-        This method is defensive against all common LLM formatting errors.
-
-        Returns:
-            A dict with at minimum a "collection" key.
-            Either "filter" (simple find) or "pipeline" (aggregation) must also
-            be present — the adapter handles both cases.
+        The LLM often wraps JSON in markdown fences or adds commentary.
+        We strip fences then attempt to extract the outermost { ... } block.
 
         Raises:
-            ValueError: If the JSON cannot be parsed or is missing required keys.
-
-        MongoDB-specific — not called for MySQL.
+            ValueError: With a descriptive message if JSON cannot be parsed.
         """
         text = raw.strip()
 
-        # ── Strip markdown code fences if present ─────────────────────────────
-        # LLM sometimes wraps output in ```json ... ``` despite instructions
+        # Strip markdown fences
         if text.startswith("```"):
-            lines = text.splitlines()
-            inner_lines = [ln for ln in lines[1:] if ln.strip() != "```"]
-            text = "\n".join(inner_lines).strip()
+            lines = text.split("\n")
+            text = "\n".join(
+                line for line in lines[1:]
+                if line.strip() not in ("```", "```json")
+            ).strip()
 
-        # ── Extract the outermost { ... } in case the LLM added prose ─────────
-        brace_start = text.find("{")
-        brace_end = text.rfind("}")
-        if brace_start != -1 and brace_end != -1 and brace_end > brace_start:
-            text = text[brace_start : brace_end + 1]
-
-        # ── Parse JSON ────────────────────────────────────────────────────────
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError as e:
+        # Find the outermost { ... } block
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
             raise ValueError(
-                f"[MongoDB] LLM returned invalid JSON for query.\n"
-                f"Parse error : {e}\n"
-                f"LLM output  : {raw[:400]!r}\n"
-                f"Hint: The LLM must return a raw JSON object starting with "
-                f"'{{' and ending with '}}'. Check the prompt template."
-            ) from e
+                f"LLM output did not contain a JSON object. "
+                f"Got: {repr(text[:200])}"
+            )
+        json_str = text[start:end + 1]
 
-        # ── Validate structure ────────────────────────────────────────────────
+        try:
+            parsed = json.loads(json_str)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                f"LLM output contained invalid JSON: {exc}. "
+                f"Raw snippet: {repr(json_str[:300])}"
+            ) from exc
+
         if not isinstance(parsed, dict):
             raise ValueError(
-                f"[MongoDB] Expected a JSON object (dict), got {type(parsed).__name__}.\n"
-                f"LLM output: {raw[:400]!r}"
+                f"Expected JSON object (dict), got {type(parsed).__name__}. "
+                f"Value: {repr(parsed)}"
             )
 
         if "collection" not in parsed:
             raise ValueError(
-                f"[MongoDB] JSON query must have a 'collection' key.\n"
-                f"Got keys  : {list(parsed.keys())}\n"
-                f"LLM output: {raw[:400]!r}\n"
-                f"Hint: The prompt instructs the LLM to always include 'collection'."
+                f"MongoDB query JSON must contain 'collection' key. "
+                f"Got keys: {list(parsed.keys())}"
             )
 
-        if "filter" not in parsed and "pipeline" not in parsed:
-            raise ValueError(
-                f"[MongoDB] JSON query must have either 'filter' or 'pipeline' key.\n"
-                f"Got keys  : {list(parsed.keys())}\n"
-                f"LLM output: {raw[:400]!r}"
-            )
-
-        logger.debug(
-            f"[MongoDB] Parsed query — collection={parsed['collection']!r}, "
-            f"type={'pipeline' if 'pipeline' in parsed else 'filter'}"
-        )
         return parsed
-
-    # ── Result quality assessment ─────────────────────────────────────────────
 
     def _assess_result_quality(self, rows: list[dict]) -> str:
         """
-        Inspect result rows and return a quality signal for the answer prompt.
+        Classify result quality for the answer prompt.
 
-        The PromptBuilder uses this to choose the right instruction for the LLM:
-            'ok'            → normal answer generation
-            'empty'         → tell user nothing was found, suggest rephrasing
-            'all_null'      → data exists but values are all null/empty
-            'low_relevance' → rows returned but may not answer the question
-
-        Works the same for MySQL and MongoDB — only the row content matters.
+        Returns one of: 'empty', 'small', 'large'
+        The answer prompt uses this to adjust LLM behaviour:
+          - 'empty'  → LLM says "no results found"
+          - 'small'  → LLM formats all rows as a table
+          - 'large'  → LLM summarizes and shows only MAX_ROWS_FOR_LLM rows
         """
-        if not rows:
+        count = len(rows)
+        if count == 0:
             return "empty"
-
-        # Check whether every value in every row is null / empty
-        all_null = all(
-            v is None or v == "" or v == [] or v == {}
-            for row in rows
-            for v in row.values()
-        )
-        if all_null:
-            return "all_null"
-
-        return "ok"
+        if count <= self._settings.MAX_ROWS_FOR_LLM:
+            return "small"
+        return "large"

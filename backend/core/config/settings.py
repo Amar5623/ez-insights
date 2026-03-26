@@ -123,6 +123,32 @@ class Settings(BaseSettings):
     # session
     APP_MONGO_URI: str = "mongodb+srv://..."   # same cluster, different DB is fine
     APP_MONGO_DB_NAME: str = "ez_insights_data"
+
+    # ── Logging ─────────────────────────────────────────────────────────────────
+    # Place this section right before the `class Config:` block.
+    #
+    # LOG_LEVEL controls verbosity:
+    #   INFO  → one line per pipeline stage (always on, for monitoring)
+    #   DEBUG → full prompts, raw LLM output, per-column scrub decisions
+    #           WARNING: DEBUG logs contain full SQL queries and answer text.
+    #           Never enable in production without log access controls.
+ 
+    LOG_LEVEL: str = "INFO"          # INFO | DEBUG | WARNING | ERROR
+
+    # ── Sensitive data masking ────────────────────────────────────────────────────
+    # SENSITIVE_TABLES: tables the schema inspector will skip (unless a safe view
+    #   named vw_<tablename> exists). Configurable per client — no hardcoding needed.
+    #
+    # SENSITIVE_COLUMNS_EXTRA: additional column names to block, on top of the
+    #   built-in list in data_scrubber.py and schema_inspector/mysql.py.
+    #
+    # SCRUB_EMAILS: whether to redact email-looking values in query results.
+    #   Set False if your UI legitimately shows email addresses.
+    
+    SENSITIVE_TABLES: list[str] = ["customers", "payments"]   # override per client
+    SENSITIVE_COLUMNS_EXTRA: list[str] = []                   # already existed, keep it
+    SCRUB_EMAILS: bool = True
+ 
       
     class Config:
         env_file = ".env"

@@ -17,6 +17,7 @@ from services.query_service import QueryService
 from api.routes import query, history, health, chats
 from api.middleware.auth import AuthMiddleware
 from api.middleware.logging import LoggingMiddleware
+from core.logging_config import setup_logging
 
 # Global service instance — created once at startup
 _query_service: QueryService | None = None
@@ -31,6 +32,9 @@ def get_query_service() -> QueryService:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: wire all factories and index schema."""
+    
+    setup_logging()
+
     global _query_service
 
     s = get_settings()

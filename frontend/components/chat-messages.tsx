@@ -173,7 +173,7 @@ function MessageBubble({ message, index }: { message: ChatMessage; index: number
           <Collapsible className="w-full animate-scale-in">
             <CollapsibleTrigger className="flex items-center gap-2 rounded-lg px-3 py-1.5 text-xs text-muted-foreground transition-all duration-200 hover:bg-muted hover:text-foreground">
               <CodeIcon className="h-3.5 w-3.5" />
-              <span>View SQL Query</span>
+              <span>View Query</span>
               <ChevronDownIcon className="h-3.5 w-3.5 transition-transform duration-200 group-data-[state=open]:rotate-180" />
             </CollapsibleTrigger>
             <CollapsibleContent className="mt-2 animate-fade-in">
