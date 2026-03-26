@@ -4,15 +4,15 @@ from api.schemas import QueryRequest, QueryResponse
 from api.dependencies import get_query_service
 from api.routes.history import append_to_history
 from services.query_service import QueryService
-
 from services.intent_classifier import classify, IntentType
 from core.config.settings import get_settings
 from core.db.mongo_data import get_data_db
-
 import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
+from fastapi.responses import StreamingResponse
+import json
 
 router = APIRouter()
 
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
-@router.post("/query", response_model=QueryResponse)
+@router.post("/query")
 async def run_query(
     body: QueryRequest,
     service: QueryService = Depends(get_query_service),
@@ -33,82 +33,105 @@ async def run_query(
     question = body.question
     now = datetime.now(timezone.utc)
 
-    # ---------------------------
-    # Intent Classification
-    # ---------------------------
-    if settings.INTENT_CLASSIFIER_ENABLED:
-        try:
-            intent = classify(
-                question=question,
-                llm=service.llm,
-                use_llm_fallback=settings.INTENT_LLM_FALLBACK,
+    async def stream():
+        # 1. Intent classification (fast, yield immediately)
+        if settings.INTENT_CLASSIFIER_ENABLED:
+            try:
+                intent = classify(
+                    question=question,
+                    llm=service.llm,
+                    use_llm_fallback=settings.INTENT_LLM_FALLBACK,
+                )
+            except Exception:
+                logger.exception("Intent classification failed")
+                intent = IntentType.AMBIGUOUS
+        else:
+            intent = IntentType.DB_QUERY
+
+        logger.info(f"[Intent] {intent} | Question: {question}")
+
+        # 2. Conversational
+        if intent in {IntentType.GREETING, IntentType.CHAT, IntentType.HELP, IntentType.FAREWELL}:
+            conversational_prompt = (
+                "You are a helpful assistant. Respond conversationally.\n\n"
+                f"User: {question}"
             )
-        except Exception:
-            logger.exception("Intent classification failed")
-            intent = IntentType.AMBIGUOUS
-    else:
-        intent = IntentType.DB_QUERY  # fallback to old behavior
+            try:
+                answer = service.llm.generate(conversational_prompt)
+            except Exception:
+                answer = "I'm here to help! Let me know what you need."
 
-    logger.info(f"[Intent] {intent} | Question: {question}")
+            payload = {
+                "question": question,
+                "sql": "",
+                "results": [],
+                "row_count": 0,
+                "strategy_used": "chat",
+                "answer": answer,
+                "error": None,
+                "done": True,
+            }
+            append_to_history({
+                "id": str(uuid.uuid4()),
+                "question": question,
+                "sql": "",
+                "strategy_used": "INTENT_CHAT",
+                "row_count": 0,
+                "answer": answer,
+                "created_at": now,
+            })
+            yield f"data: {json.dumps(payload)}\n\n"
+            return
 
-    # ---------------------------
-    # Conversational Handling
-    # (GREETING, CHAT, HELP, FAREWELL)
-    # No DB query is executed — LLM answers directly.
-    # MongoDB persistence is skipped for conversational turns.
-    # ---------------------------
-    if intent in {
-        IntentType.GREETING,
-        IntentType.CHAT,
-        IntentType.HELP,
-        IntentType.FAREWELL,
-    }:
-        conversational_prompt = (
-            "You are a helpful assistant. Respond conversationally.\n\n"
-            f"User: {question}"
-        )
+        # 3. Ambiguous
+        if intent == IntentType.AMBIGUOUS:
+            answer = (
+                "I'm not sure if this is a database-related request. "
+                "Could you please clarify?"
+            )
+            payload = {
+                "question": question,
+                "sql": "",
+                "results": [],
+                "row_count": 0,
+                "strategy_used": "INTENT_AMBIGUOUS",
+                "answer": answer,
+                "error": None,
+                "done": True,
+            }
+            append_to_history({
+                "id": str(uuid.uuid4()),
+                "question": question,
+                "sql": "",
+                "strategy_used": "INTENT_AMBIGUOUS",
+                "row_count": 0,
+                "answer": answer,
+                "created_at": now,
+            })
+            yield f"data: {json.dumps(payload)}\n\n"
+            return
 
-        try:
-            answer = service.llm.generate(conversational_prompt)
-        except Exception:
-            logger.exception("Conversational LLM call failed")
-            answer = "I'm here to help! Let me know what you need."
+        # 4. DB Query — yield a "thinking" event first
+        yield f"data: {json.dumps({'status': 'thinking', 'done': False})}\n\n"
 
-        result = QueryResponse(
-            question=question,
-            sql="",
-            results=[],
-            row_count=0,
-            strategy_used="chat",
-            answer=answer,
-            error=None,
-        )
-
-        append_to_history({
-            "id": str(uuid.uuid4()),
-            "question": question,
-            "sql": "",
-            "strategy_used": "INTENT_CHAT",
-            "row_count": 0,
-            "answer": answer,
-            "created_at": now,
-        })
-
-        return result
-
-    # ---------------------------
-    # Database Query Handling
-    # Context window is passed so the LLM can reference prior turns.
-    # Results are persisted to MongoDB when chat headers are present.
-    # ---------------------------
-    if intent == IntentType.DB_QUERY:
+        # Run the pipeline
         result = service.run(question, context=body.context or [])
 
         if result.error:
             logger.error(f"QueryService error: {result.error}")
-            raise HTTPException(status_code=500, detail=result.error)
+            payload = {
+                "question": question,
+                "sql": "",
+                "results": [],
+                "row_count": 0,
+                "strategy_used": result.strategy_used,
+                "answer": "",
+                "error": result.error,
+                "done": True,
+            }
+            yield f"data: {json.dumps(payload)}\n\n"
+            return
 
-        # Keep existing in-memory history (backward compat)
         append_to_history({
             "id": str(uuid.uuid4()),
             "question": result.question,
@@ -119,7 +142,6 @@ async def run_query(
             "created_at": now,
         })
 
-        # Persist to MongoDB if frontend sent chat context headers
         if x_chat_id and x_user_id:
             try:
                 db = get_data_db()
@@ -150,41 +172,26 @@ async def run_query(
                     {"$set": {"updated_at": now}},
                 )
             except Exception as e:
-                # Never fail the query response because of a persistence error
                 logger.warning(f"[query] Failed to persist messages: {e}")
 
-        return result
+        # Stream the answer token by token (word by word)
+        words = result.answer.split(" ")
+        for i, word in enumerate(words):
+            chunk = word if i == 0 else " " + word
+            yield f"data: {json.dumps({'chunk': chunk, 'done': False})}\n\n"
 
-    # ---------------------------
-    # Ambiguous Handling
-    # Intent could not be classified confidently.
-    # No DB query is executed — ask the user to clarify.
-    # ---------------------------
-    logger.warning(f"Ambiguous intent for question: {question}")
+        # Final done event with metadata
+        payload = {
+            "question": result.question,
+            "sql": result.sql,
+            "row_count": result.row_count,
+            "strategy_used": result.strategy_used,
+            "error": None,
+            "done": True,
+        }
+        yield f"data: {json.dumps(payload)}\n\n"
 
-    answer = (
-        "I'm not sure if this is a database-related request. "
-        "Could you please clarify?"
-    )
-
-    result = QueryResponse(
-        question=question,
-        sql="",
-        results=[],
-        row_count=0,
-        strategy_used="INTENT_AMBIGUOUS",
-        answer=answer,
-        error=None,
-    )
-
-    append_to_history({
-        "id": str(uuid.uuid4()),
-        "question": question,
-        "sql": "",
-        "strategy_used": "INTENT_AMBIGUOUS",
-        "row_count": 0,
-        "answer": answer,
-        "created_at": now,
+    return StreamingResponse(stream(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
     })
-
-    return result

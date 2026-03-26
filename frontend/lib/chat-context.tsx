@@ -8,7 +8,7 @@ import {
   useCallback,
   type ReactNode,
 } from 'react'
-import type { Chat, ChatMessage } from './types'
+import type { Chat, ChatMessage, QueryResponse } from './types'
 import { sendQuery, fetchChats, createChat, deleteChatAPI, fetchMessages, updateChatTitle, setActiveChatContext } from './api'
 import { useAuth } from './auth-context'
 
@@ -183,8 +183,8 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       console.error('[chat] Failed to delete chat:', err)
     }
   }, [user, currentChatId])
-
-  const sendMessage = useCallback(async (content: string) => {
+  
+const sendMessage = useCallback(async (content: string) => {
     if (!user || isSending) return
 
     let activeChatId = currentChatId
@@ -228,44 +228,91 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
     try {
       const context = buildContextWindow(chat.messages)
-      const response = await sendQuery({ question: content, context })
+      let streamedAnswer = ''
 
-      const assistantMessage: ChatMessage = {
-        id: loadingMessage.id,
-        role: 'assistant',
-        content: response.answer,
-        sql: response.sql,
-        results: response.results,
-        row_count: response.row_count,
-        strategy_used: response.strategy_used,
-        timestamp: new Date(),
-      }
+      await sendQuery(
+        { question: content, context },
 
-      setChats(prev => prev.map(c =>
-        c.id === activeChatId
-          ? {
-              ...c,
-              messages: c.messages.map(m =>
-                m.id === loadingMessage.id ? assistantMessage : m,
-              ),
-              updated_at: new Date(),
-            }
-          : c,
-      ))
+        // onChunk — append each word chunk into the loading message
+        (chunk: string) => {
+          streamedAnswer += chunk
+          setChats(prev => prev.map(c =>
+            c.id === activeChatId
+              ? {
+                  ...c,
+                  messages: c.messages.map(m =>
+                    m.id === loadingMessage.id
+                      ? { ...m, content: streamedAnswer, isLoading: false }
+                      : m,
+                  ),
+                }
+              : c,
+          ))
+        },
+
+        // onDone — attach sql/strategy metadata once stream ends
+        (meta: Partial<QueryResponse>) => {
+          setChats(prev => prev.map(c =>
+            c.id === activeChatId
+              ? {
+                  ...c,
+                  messages: c.messages.map(m =>
+                    m.id === loadingMessage.id
+                      ? {
+                          ...m,
+                          content: streamedAnswer,
+                          sql: meta.sql,
+                          row_count: meta.row_count,
+                          strategy_used: meta.strategy_used,
+                          isLoading: false,
+                          timestamp: new Date(),
+                        }
+                      : m,
+                  ),
+                  updated_at: new Date(),
+                }
+              : c,
+          ))
+        },
+
+        // onError — replace loading bubble with error text
+        (err: string) => {
+          setChats(prev => prev.map(c =>
+            c.id === activeChatId
+              ? {
+                  ...c,
+                  messages: c.messages.map(m =>
+                    m.id === loadingMessage.id
+                      ? {
+                          ...m,
+                          content: err,
+                          isLoading: false,
+                          timestamp: new Date(),
+                        }
+                      : m,
+                  ),
+                }
+              : c,
+          ))
+        },
+      )
     } catch (error) {
-      const errorMessage: ChatMessage = {
-        id: loadingMessage.id,
-        role: 'assistant',
-        content: error instanceof Error ? error.message : 'An error occurred while processing your query.',
-        timestamp: new Date(),
-      }
-
+      // Catches network-level failures before the stream starts
       setChats(prev => prev.map(c =>
         c.id === activeChatId
           ? {
               ...c,
               messages: c.messages.map(m =>
-                m.id === loadingMessage.id ? errorMessage : m,
+                m.id === loadingMessage.id
+                  ? {
+                      ...m,
+                      content: error instanceof Error
+                        ? error.message
+                        : 'An error occurred while processing your query.',
+                      isLoading: false,
+                      timestamp: new Date(),
+                    }
+                  : m,
               ),
             }
           : c,
@@ -274,7 +321,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       setIsSending(false)
     }
   }, [user, currentChatId, isSending, chats, createNewChat])
-
   return (
     <ChatContext.Provider value={{
       chats,
