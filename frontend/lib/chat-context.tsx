@@ -252,28 +252,31 @@ const sendMessage = useCallback(async (content: string) => {
 
         // onDone — attach sql/strategy metadata once stream ends
         (meta: Partial<QueryResponse>) => {
-          setChats(prev => prev.map(c =>
-            c.id === activeChatId
+          if (meta.answer) {
+    streamedAnswer = meta.answer
+  }
+  setChats(prev => prev.map(c =>
+    c.id === activeChatId
+      ? {
+          ...c,
+          messages: c.messages.map(m =>
+            m.id === loadingMessage.id
               ? {
-                  ...c,
-                  messages: c.messages.map(m =>
-                    m.id === loadingMessage.id
-                      ? {
-                          ...m,
-                          content: streamedAnswer,
-                          sql: meta.sql,
-                          row_count: meta.row_count,
-                          strategy_used: meta.strategy_used,
-                          isLoading: false,
-                          timestamp: new Date(),
-                        }
-                      : m,
-                  ),
-                  updated_at: new Date(),
+                  ...m,
+                  content: streamedAnswer,
+                  sql: meta.sql,
+                  row_count: meta.row_count,
+                  strategy_used: meta.strategy_used,
+                  isLoading: false,
+                  timestamp: new Date(),
                 }
-              : c,
-          ))
-        },
+              : m,
+          ),
+          updated_at: new Date(),
+        }
+      : c,
+  ))
+},
 
         // onError — replace loading bubble with error text
         (err: string) => {

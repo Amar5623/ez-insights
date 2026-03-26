@@ -15,23 +15,112 @@ import * as ScrollAreaPrimitive from '@radix-ui/react-scroll-area'
 import {
   UserIcon,
   BotIcon,
-  CodeIcon, 
+  CodeIcon,
+  ChevronDownIcon,
   SparklesIcon,
   ZapIcon,
-  ChevronDownIcon
 } from 'lucide-react'
 
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
+// ── Markdown renderer ──────────────────────────────────────────────────────────
+// Parses the LLM answer into segments: markdown tables → <table>, rest → <p>
+// No external library needed.
 
-// ── Constants ──────────────────────────────────────────────────────────────────
-const PAGE_SIZE = 10
-       
+function parseMarkdownTable(block: string): { headers: string[]; rows: string[][] } | null {
+  const lines = block.trim().split('\n').filter(l => l.trim())
+  if (lines.length < 2) return null
+  const isSeparator = (l: string) => /^\|?[\s\-|:]+\|?$/.test(l.trim())
+  if (!isSeparator(lines[1])) return null
+
+  const parseRow = (l: string) =>
+    l.trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim())
+
+  const headers = parseRow(lines[0])
+  const rows = lines.slice(2).map(parseRow)
+  return { headers, rows }
+}
+
+function MarkdownTable({ block }: { block: string }) {
+  const parsed = parseMarkdownTable(block)
+  if (!parsed) return <p className="text-sm leading-relaxed whitespace-pre-wrap">{block}</p>
+
+  const { headers, rows } = parsed
+
+  return (
+    <div className="my-2 overflow-hidden rounded-xl border border-border shadow-sm">
+      <div className="overflow-x-auto">
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="border-b border-border bg-muted/70">
+              {headers.map((h, i) => (
+                <th key={i} className="whitespace-nowrap px-4 py-3 text-left font-semibold text-foreground">
+                  {h}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row, i) => (
+              <tr key={i} className="border-b border-border/50 last:border-0 transition-colors hover:bg-muted/30">
+                {row.map((cell, j) => (
+                  <td key={j} className="whitespace-nowrap px-4 py-2.5 text-muted-foreground">
+                    {cell}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  )
+}
+
+// Splits answer text into table blocks and text blocks, renders each correctly
+function MarkdownAnswer({ content }: { content: string }) {
+  // Split on markdown table blocks (lines starting with |)
+  const segments = content.split(/((?:^\|.+\n?)+)/m)
+
+  return (
+    <div className="space-y-1">
+      {segments.map((segment, i) => {
+        if (!segment.trim()) return null
+        const lines = segment.trim().split('\n')
+        const looksLikeTable = lines.length >= 2 && lines[0].trim().startsWith('|')
+
+        if (looksLikeTable) {
+          return <MarkdownTable key={i} block={segment} />
+        }
+
+        // Plain text — render with basic formatting
+        return (
+          <div key={i} className="text-sm leading-relaxed">
+            {segment.split('\n').map((line, j) => {
+              if (!line.trim()) return <br key={j} />
+
+              // Bold: **text**
+              const parts = line.split(/(\*\*[^*]+\*\*)/g)
+              return (
+                <p key={j} className="my-0.5">
+                  {parts.map((part, k) =>
+                    part.startsWith('**') && part.endsWith('**')
+                      ? <strong key={k} className="font-semibold text-foreground">{part.slice(2, -2)}</strong>
+                      : part
+                  )}
+                </p>
+              )
+            })}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
 // ── LoadingBubble ──────────────────────────────────────────────────────────────
 function LoadingBubble() {
   return (
     <div className="flex gap-3 animate-fade-in">
-      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-linear-to-br from-primary/20 to-primary/10 ring-2 ring-primary/20">
+      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-primary/20 to-primary/10 ring-2 ring-primary/20">
         <BotIcon className="h-4 w-4 text-primary animate-pulse-subtle" />
       </div>
       <div className="flex-1 space-y-3 py-1">
@@ -51,7 +140,8 @@ function LoadingBubble() {
 function MessageBubble({ message, index }: { message: ChatMessage; index: number }) {
   const isUser = message.role === 'user'
 
-  if (message.isLoading) {
+  // Show loading bubble only when isLoading AND no content yet (first chunk not arrived)
+  if (message.isLoading && !message.content) {
     return <LoadingBubble />
   }
 
@@ -68,7 +158,7 @@ function MessageBubble({ message, index }: { message: ChatMessage; index: number
           'flex h-9 w-9 shrink-0 items-center justify-center rounded-xl transition-transform duration-300 hover:scale-105',
           isUser
             ? 'bg-primary shadow-md shadow-primary/25'
-            : 'bg-linear-to-br from-primary/20 to-primary/10 ring-2 ring-primary/20'
+            : 'bg-gradient-to-br from-primary/20 to-primary/10 ring-2 ring-primary/20'
         )}
       >
         {isUser ? (
@@ -85,38 +175,28 @@ function MessageBubble({ message, index }: { message: ChatMessage; index: number
         )}
       >
         <div
-  className={cn(
-    'rounded-2xl px-4 py-3 shadow-sm transition-all duration-300',
-    isUser
-      ? 'bg-primary text-primary-foreground shadow-primary/20'
-      : 'bg-card border border-border text-foreground'
-  )}
->
-  {isUser ? (
-    <p className="whitespace-pre-wrap text-sm leading-relaxed">
-      {message.content}
-    </p>
-  ) : (
-    <div className="prose prose-sm dark:prose-invert max-w-none
-      prose-table:w-full prose-table:text-xs
-      prose-th:px-3 prose-th:py-2 prose-th:text-left prose-th:font-semibold prose-th:border prose-th:border-border
-      prose-td:px-3 prose-td:py-2 prose-td:border prose-td:border-border prose-td:text-muted-foreground
-      prose-thead:bg-muted/70 prose-tr:transition-colors hover:prose-tr:bg-muted/30
-      prose-p:leading-relaxed prose-p:text-sm prose-p:my-1
-      prose-strong:text-foreground prose-code:text-xs prose-code:bg-muted prose-code:px-1 prose-code:rounded">
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>
-        {message.content}
-      </ReactMarkdown>
-    </div>
-  )}
-</div>
+          className={cn(
+            'rounded-2xl px-4 py-3 shadow-sm transition-all duration-300',
+            isUser
+              ? 'bg-primary text-primary-foreground shadow-primary/20'
+              : 'bg-card border border-border text-foreground'
+          )}
+        >
+          {isUser ? (
+            <p className="whitespace-pre-wrap text-sm leading-relaxed">
+              {message.content}
+            </p>
+          ) : (
+            <MarkdownAnswer content={message.content} />
+          )}
+        </div>
 
-        {/* SQL Preview — unchanged */}
+        {/* SQL Preview */}
         {message.sql && (
           <Collapsible className="w-full animate-scale-in">
             <CollapsibleTrigger className="flex items-center gap-2 rounded-lg px-3 py-1.5 text-xs text-muted-foreground transition-all duration-200 hover:bg-muted hover:text-foreground">
               <CodeIcon className="h-3.5 w-3.5" />
-              <span>View Query</span>
+              <span>View SQL Query</span>
               <ChevronDownIcon className="h-3.5 w-3.5 transition-transform duration-200 group-data-[state=open]:rotate-180" />
             </CollapsibleTrigger>
             <CollapsibleContent className="mt-2 animate-fade-in">
@@ -127,7 +207,7 @@ function MessageBubble({ message, index }: { message: ChatMessage; index: number
           </Collapsible>
         )}
 
-        {/* Strategy Badge — unchanged */}
+        {/* Strategy Badge */}
         {message.strategy_used && (
           <Badge
             variant="secondary"
@@ -150,13 +230,10 @@ function MessageBubble({ message, index }: { message: ChatMessage; index: number
 }
 
 // ── ChatMessages ───────────────────────────────────────────────────────────────
-export function   ChatMessages({ sidebarOpen }: { sidebarOpen: boolean }) {
+export function ChatMessages({ sidebarOpen }: { sidebarOpen: boolean }) {
   const { currentChat, isLoading, sendMessage } = useChat()
-  // FIX: Direct ref to the Radix ScrollArea Viewport so we can imperatively
-  // set scrollTop — avoids the scrollIntoView-on-wrong-ancestor bug.
   const viewportRef = useRef<HTMLDivElement>(null)
 
-  // Auto-scroll to bottom when new messages arrive
   useEffect(() => {
     if (!viewportRef.current) return
     viewportRef.current.scrollTop = viewportRef.current.scrollHeight
@@ -185,7 +262,7 @@ export function   ChatMessages({ sidebarOpen }: { sidebarOpen: boolean }) {
     return (
       <div className="flex flex-1 items-center justify-center p-8">
         <div className="max-w-md text-center animate-fade-in-up">
-          <div className="mx-auto mb-6 flex h-20 w-20 items-center justify-center rounded-3xl bg-linear-to-br from-primary/20 to-primary/5 ring-4 ring-primary/10 shadow-lg shadow-primary/10">
+          <div className="mx-auto mb-6 flex h-20 w-20 items-center justify-center rounded-3xl bg-gradient-to-br from-primary/20 to-primary/5 ring-4 ring-primary/10 shadow-lg shadow-primary/10">
             <BotIcon className="h-10 w-10 text-primary" />
           </div>
           <h2 className="mb-3 text-2xl font-semibold text-foreground">
@@ -213,20 +290,17 @@ export function   ChatMessages({ sidebarOpen }: { sidebarOpen: boolean }) {
     )
   }
 
-  // Has messages — logo + name stay at top, description + chips are gone
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
-      {/* Sticky header — logo + name only */}
       {!sidebarOpen && (
         <div className="flex items-center gap-3 border-b border-border px-6 py-3 bg-background/80 backdrop-blur-sm animate-fade-in">
-          <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-linear-to-br from-primary/20 to-primary/5 ring-2 ring-primary/10">
+          <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-gradient-to-br from-primary/20 to-primary/5 ring-2 ring-primary/10">
             <BotIcon className="h-4 w-4 text-primary" />
           </div>
           <span className="font-semibold text-foreground">Ez-Insights</span>
         </div>
       )}
 
-      {/* Messages */}
       <ScrollAreaPrimitive.Root className="flex-1 overflow-hidden theme-transition">
         <ScrollAreaPrimitive.Viewport ref={viewportRef} className="h-full w-full">
           <div className="mx-auto max-w-3xl space-y-6 p-6 pb-8">
@@ -235,7 +309,7 @@ export function   ChatMessages({ sidebarOpen }: { sidebarOpen: boolean }) {
             ))}
           </div>
         </ScrollAreaPrimitive.Viewport>
-        <ScrollAreaPrimitive.Scrollbar orientation="vertical" className="flex touch-none select-none transition-colors h-full w-2.5 border-l border-l-transparent p-px">
+        <ScrollAreaPrimitive.Scrollbar orientation="vertical" className="flex touch-none select-none transition-colors h-full w-2.5 border-l border-l-transparent p-[1px]">
           <ScrollAreaPrimitive.Thumb className="relative flex-1 rounded-full bg-border" />
         </ScrollAreaPrimitive.Scrollbar>
       </ScrollAreaPrimitive.Root>
