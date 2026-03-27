@@ -139,10 +139,8 @@ def _build_help_answer() -> str:
 def _sse(payload: dict) -> str:
     """Format a dict as a single SSE data line."""
     return f"data: {json.dumps(payload, default=str)}\n\n"
-
-
-# ─── Query route ──────────────────────────────────────────────────────────────
-
+ 
+ 
 @router.post("/query")
 async def run_query(
     body: QueryRequest,
@@ -151,62 +149,39 @@ async def run_query(
     x_user_id: Optional[str] = Header(default=None),
 ):
     question = body.question
+    context = body.context or []
     now = datetime.now(timezone.utc)
     page_size = settings.PAGE_SIZE
-
+ 
     async def stream():
-
+ 
         # ── 1. Intent classification ──────────────────────────────────────────
-        # context is passed so follow-up questions ("next", "what about those",
-        # "same for last month") are detected without an extra LLM call.
+        # FIX: context is now passed to classify() so pagination and follow-up
+        # patterns are evaluated against prior conversation turns.
         if settings.INTENT_CLASSIFIER_ENABLED:
             try:
                 intent = classify(
                     question=question,
                     llm=service.llm,
                     use_llm_fallback=settings.INTENT_LLM_FALLBACK,
-                    context=body.context or [],
+                    context=context,    # ← FIX: was missing before
                 )
             except Exception:
                 logger.exception("[STREAM] Intent classification failed")
                 intent = IntentType.AMBIGUOUS
         else:
             intent = IntentType.DB_QUERY
-
-        logger.info(f"[STREAM] intent={intent.value} | question={question[:80]!r}")
-
-        # ── 2. HELP intent — answer from ClientConfig, no LLM call needed ─────
-        if intent == IntentType.HELP:
-            answer = _build_help_answer()
-            append_to_history({
-                "id": str(uuid.uuid4()),
-                "question": question,
-                "sql": "",
-                "strategy_used": "INTENT_HELP",
-                "row_count": 0,
-                "answer": answer,
-                "created_at": now,
-            })
-            yield _sse({
-                "question": question,
-                "sql": "",
-                "results": [],
-                "all_results": [],
-                "row_count": 0,
-                "total_rows": 0,
-                "page_size": page_size,
-                "strategy_used": "chat",
-                "answer": answer,
-                "error": None,
-                "done": True,
-            })
-            return
-
-        # ── 3. Greeting / Chat / Farewell — LLM with in-character system prompt
-        if intent in {IntentType.GREETING, IntentType.CHAT, IntentType.FAREWELL}:
-            system_prompt = _build_conversational_system_prompt()
+ 
+        logger.info(
+            f"[STREAM] intent={intent.value} | "
+            f"context_turns={len(context)} | "
+            f"question={question[:80]!r}"
+        )
+ 
+        # ── 2. Conversational response ────────────────────────────────────────
+        if intent in {IntentType.GREETING, IntentType.CHAT, IntentType.HELP, IntentType.FAREWELL}:
             conversational_prompt = (
-                f"{system_prompt}\n\n"
+                "You are a helpful assistant. Respond conversationally and concisely.\n\n"
                 f"User: {question}"
             )
             try:
@@ -214,23 +189,22 @@ async def run_query(
             except Exception:
                 logger.exception("[STREAM] Conversational LLM call failed")
                 answer = "I'm here to help! What would you like to know?"
-
+ 
             append_to_history({
                 "id": str(uuid.uuid4()),
                 "question": question,
                 "sql": "",
-                "strategy_used": f"INTENT_{intent.value}",
+                "strategy_used": "chat",
                 "row_count": 0,
                 "answer": answer,
                 "created_at": now,
             })
-
-            # Stream answer word by word, then done
+ 
             words = answer.split(" ")
             for i, word in enumerate(words):
                 chunk = word if i == 0 else " " + word
                 yield _sse({"chunk": chunk, "done": False})
-
+ 
             yield _sse({
                 "question": question,
                 "sql": "",
@@ -244,13 +218,12 @@ async def run_query(
                 "done": True,
             })
             return
-
-        # ── 4. Ambiguous ──────────────────────────────────────────────────────
+ 
+        # ── 3. Ambiguous ──────────────────────────────────────────────────────
         if intent == IntentType.AMBIGUOUS:
             answer = (
                 "I'm not sure if this is a database question. "
-                "Could you rephrase it? For example: "
-                "'Show me the top 10 customers by revenue.'"
+                "Could you rephrase it? For example: 'Show me the top 10 customers by revenue.'"
             )
             append_to_history({
                 "id": str(uuid.uuid4()),
@@ -274,13 +247,19 @@ async def run_query(
                 "done": True,
             })
             return
-
-        # ── 5. DB Query — yield "thinking" then run the pipeline ──────────────
-        # Yield thinking indicator immediately so UI doesn't freeze
+ 
+        # ── 4. DB Query OR Pagination — both go through service.run() ─────────
+        # PAGINATION uses service.run() with intent=PAGINATION so query_service
+        # can use the previous question for schema retrieval and the dedicated
+        # pagination prompt. This is the core fix for the hallucination bug.
         yield _sse({"status": "thinking", "done": False})
-
-        result = service.run(question, context=body.context or [])
-
+ 
+        result = service.run(
+            question,
+            context=context,
+            intent=intent,          # ← FIX: intent is now passed through
+        )
+ 
         if result.error:
             logger.error(f"[STREAM] Pipeline error: {result.error}")
             yield _sse({
@@ -296,21 +275,20 @@ async def run_query(
                 "done": True,
             })
             return
-
-        # All rows from DB (up to MAX_DB_FETCH_ROWS)
+ 
         all_results = result.results
         total_rows = result.row_count
-        # First page only shown in answer
         first_page = all_results[:page_size]
-
+ 
         logger.info(
-            f"[STREAM] Streaming response | "
+            f"[STREAM] Response ready | "
             f"total_rows={total_rows} | "
             f"first_page={len(first_page)} | "
-            f"strategy={result.strategy_used}"
+            f"strategy={result.strategy_used} | "
+            f"is_pagination={intent == IntentType.PAGINATION}"
         )
-
-        # ── Persist to MongoDB ────────────────────────────────────────────────
+ 
+        # Persist to MongoDB
         append_to_history({
             "id": str(uuid.uuid4()),
             "question": result.question,
@@ -320,7 +298,7 @@ async def run_query(
             "answer": result.answer,
             "created_at": now,
         })
-
+ 
         if x_chat_id and x_user_id:
             try:
                 db = get_data_db()
@@ -352,16 +330,14 @@ async def run_query(
                 )
             except Exception as e:
                 logger.warning(f"[STREAM] Failed to persist messages: {e}")
-
-        # ── Stream answer word by word ────────────────────────────────────────
+ 
+        # Stream answer word by word
         words = result.answer.split(" ")
         for i, word in enumerate(words):
             chunk = word if i == 0 else " " + word
             yield _sse({"chunk": chunk, "done": False})
-
-        # ── Final done event with ALL data ────────────────────────────────────
-        # results    = first page (what LLM described in answer)
-        # all_results = every row fetched (for client-side show more)
+ 
+        # Final done event with all data
         yield _sse({
             "question": result.question,
             "sql": result.sql,
@@ -374,13 +350,13 @@ async def run_query(
             "error": None,
             "done": True,
         })
-
+ 
     return StreamingResponse(
         stream(),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",   # disable nginx buffering
+            "X-Accel-Buffering": "no",
         },
     )

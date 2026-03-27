@@ -1,24 +1,20 @@
 """
 rag/prompt_builder.py
 
-Builds the prompts sent to the LLM for:
-  1. SQL / Mongo query generation  (build_query_prompt)
-  2. Natural language answer generation (build_answer_prompt)
+Builds the prompts sent to the LLM.
 
-IMPORTANT CHANGE FROM ORIGINAL:
-    All hardcoded strings (SQL_SYSTEM_PROMPT, ANSWER_SYSTEM_PROMPT,
-    DB_SCHEMA_CONTEXT) have been REMOVED from this file.
-    They now live in the client config bundle:
-        client-configs/<client>/prompts/sql_system.md
-        client-configs/<client>/prompts/answer_system.md
-        client-configs/<client>/db_context.yaml
+KEY CHANGE FROM PREVIOUS VERSION:
+    build_query_prompt() now accepts:
+      - context: list[dict]  — prior conversation turns (question, sql, answer)
+      - is_pagination: bool  — True when the user typed "show more" / "next"
 
-    This file is now 100% generic — it works for any client
-    without modification.
+    When context is present, the conversation history (Q + SQL) is injected
+    into the SQL generation prompt so the LLM knows what it was doing before.
 
-    To onboard a new client: copy client-configs/classicmodels/,
-    edit the files in the new folder, set CLIENT_CONFIG_PATH in .env.
-    This file never changes.
+    When is_pagination=True, a dedicated PAGINATION_PROMPT_TEMPLATE is used
+    instead of the normal SQL template. This tells the LLM EXACTLY what to do:
+      "Take this SQL, add LIMIT X OFFSET Y, return ONLY the modified SQL."
+    The LLM cannot hallucinate a different table because the SQL is explicit.
 """
 
 import json
@@ -29,10 +25,9 @@ from core.logging_config import get_logger, truncate
 logger = get_logger(__name__)
 
 
-# ── User message templates ────────────────────────────────────────────────────
-# These are structural templates — not client-specific content.
-# They define WHERE the dynamic parts go in the user message.
-# The content (db_schema_context, business rules) all comes from client config.
+# ── SQL generation user message template ─────────────────────────────────────
+# CHANGE: added {conversation_context} section between schema and question.
+# When there is no prior context, this section says "(First message — no prior turns)".
 
 _SQL_USER_TEMPLATE = """## Static DB Context
 {db_context}
@@ -40,22 +35,63 @@ _SQL_USER_TEMPLATE = """## Static DB Context
 ## RAG-Retrieved Schema (most relevant tables for this question)
 {schema_context}
 
-## Previous Attempts (if any)
+## Conversation History
+{conversation_context}
+
+## Previous Generation Attempts (if any)
 {attempt_history}
 
-## Question
+## Current Question
 {question}""".strip()
 
+
+# ── Pagination-specific prompt template ───────────────────────────────────────
+# Used INSTEAD of the normal template when is_pagination=True.
+# Extremely explicit: gives the LLM the exact SQL and tells it to paginate.
+# No schema chunks needed — the previous SQL already knows the right table.
+
+_PAGINATION_PROMPT_TEMPLATE = """## Task
+The user wants to see the next page of results from their previous query.
+
+## Previous SQL (the exact query that was just executed)
+{previous_sql}
+
+## Pagination Parameters
+- Page size: {page_size} rows per page
+- Current offset: {current_offset} rows already shown
+- Next offset: {next_offset}
+
+## Your Job
+Return ONLY a modified version of the Previous SQL above with:
+  LIMIT {page_size} OFFSET {next_offset}
+
+Rules:
+1. Keep EVERY other part of the SQL identical — same table, same WHERE clause, same ORDER BY
+2. If the original SQL has a LIMIT clause, replace it with LIMIT {page_size} OFFSET {next_offset}
+3. If the original SQL has no LIMIT clause, add LIMIT {page_size} OFFSET {next_offset} at the end
+4. Do NOT change the table name, columns, filters, or ORDER BY
+5. Output ONLY the SQL — no explanation, no markdown fences
+
+## Current question from user
+{question}""".strip()
+
+
+# ── Mongo template (unchanged) ─────────────────────────────────────────────────
 
 _MONGO_USER_TEMPLATE = """## RAG-Retrieved Schema (inferred from sampled documents)
 {schema_context}
 
-## Previous Attempts (if any)
+## Conversation History
+{conversation_context}
+
+## Previous Generation Attempts (if any)
 {attempt_history}
 
-## Question
+## Current Question
 {question}""".strip()
 
+
+# ── Answer generation template (unchanged) ────────────────────────────────────
 
 _ANSWER_USER_TEMPLATE = """## Conversation Context
 {context}
@@ -74,7 +110,6 @@ _ANSWER_USER_TEMPLATE = """## Conversation Context
 
 
 # ── Quality instructions ──────────────────────────────────────────────────────
-# These are generic — no client-specific content.
 
 _QUALITY_INSTRUCTIONS: dict[str, str] = {
     "small": (
@@ -88,6 +123,15 @@ _QUALITY_INSTRUCTIONS: dict[str, str] = {
         "End with exactly this line: "
         "'_Showing {page_size} of {total_rows} results. "
         "Say **show more** to see the next {page_size}._'"
+    ),
+    "pagination": (
+        "The user asked for the next page of results. "
+        "These are rows {offset_start}–{offset_end} of {total_rows} total. "
+        "Present them as a markdown table. "
+        "If there are more rows, end with: "
+        "'_Showing rows {offset_start}–{offset_end} of {total_rows}. "
+        "Say **show more** for the next page._' "
+        "If this is the last page, say: '_You have seen all {total_rows} results._'"
     ),
     "empty": (
         "No results were returned. Tell the user clearly that nothing was found. "
@@ -107,25 +151,13 @@ _QUALITY_INSTRUCTIONS: dict[str, str] = {
 # ── PromptBuilder ─────────────────────────────────────────────────────────────
 
 class PromptBuilder:
-    """
-    Builds prompts for SQL generation and NL answer generation.
-
-    All client-specific content (system prompts, DB context, business rules)
-    is loaded from the client config bundle via get_client_config().
-
-    This class is stateless beyond the adapter reference — it reads from
-    the cached ClientConfig on every call (which is a no-op after first load).
-    """
 
     def __init__(self, adapter: BaseDBAdapter):
         self.adapter = adapter
-        # Eagerly load client config at construction time so any config errors
-        # surface at startup, not on the first user request.
         cfg = get_client_config()
         logger.info(
             f"[PROMPT] PromptBuilder initialized | "
-            f"client='{cfg.company_name}' | "
-            f"db_type={adapter.db_type}"
+            f"client='{cfg.company_name}' | db_type={adapter.db_type}"
         )
 
     # ── SQL / Query generation ─────────────────────────────────────────────────
@@ -135,27 +167,57 @@ class PromptBuilder:
         question: str,
         schema_chunks: list[dict],
         attempt_history: list = None,
+        context: list[dict] | None = None,
+        is_pagination: bool = False,
+        pagination_offset: int = 0,
     ) -> dict[str, str]:
         """
         Build the SQL or Mongo query generation prompt.
 
-        Returns {"system": ..., "user": ...} for use as separate LLM roles.
-
-        The system message comes from client config (sql_system.md).
-        The user message combines:
-          - Static DB context from db_context.yaml (table structure, valid values, FK chain)
-          - RAG-retrieved schema chunks (the most relevant tables for this specific question)
-          - Prior attempt history (for the retry loop)
-          - The question itself
-
         Args:
-            question:        The user's natural language question.
-            schema_chunks:   Top-K schema chunks from SchemaRetriever.retrieve().
-            attempt_history: List of AttemptRecord from prior failed attempts.
+            question:          The user's natural language question.
+            schema_chunks:     Top-K schema chunks from SchemaRetriever.retrieve().
+            attempt_history:   List of AttemptRecord from prior failed attempts.
+            context:           Prior conversation turns: [{"question", "sql", "answer"}, ...]
+            is_pagination:     True when the user typed "show more" / "next".
+            pagination_offset: How many rows have already been shown (for OFFSET calc).
+
+        Returns {"system": ..., "user": ...}
         """
         cfg = get_client_config()
+        from core.config.settings import get_settings
+        settings = get_settings()
 
-        # Format schema chunks from RAG retrieval
+        # ── Pagination path ───────────────────────────────────────────────────
+        # Completely different prompt — explicit SQL + LIMIT/OFFSET instruction.
+        # The LLM cannot hallucinate the wrong table because we give it the SQL.
+        if is_pagination and context:
+            previous_sql = self._get_last_sql(context)
+            if previous_sql:
+                page_size = settings.PAGE_SIZE
+                user_content = _PAGINATION_PROMPT_TEMPLATE.format(
+                    previous_sql=previous_sql,
+                    page_size=page_size,
+                    current_offset=pagination_offset,
+                    next_offset=pagination_offset + page_size,
+                    question=question,
+                )
+                logger.info(
+                    f"[PROMPT] Built PAGINATION prompt | "
+                    f"previous_sql={truncate(previous_sql, 80)} | "
+                    f"offset={pagination_offset} → {pagination_offset + page_size}"
+                )
+                return {
+                    "system": cfg.sql_system_prompt,
+                    "user": user_content,
+                }
+            else:
+                logger.warning(
+                    "[PROMPT] Pagination requested but no previous SQL found in context — "
+                    "falling through to normal prompt"
+                )
+
+        # ── Normal path ───────────────────────────────────────────────────────
         schema_context = "\n\n".join(
             chunk.get("schema_text", "") for chunk in schema_chunks
             if chunk.get("schema_text")
@@ -164,37 +226,34 @@ class PromptBuilder:
             schema_context = "(No relevant schema chunks retrieved)"
 
         history_text = self._format_history(attempt_history or [])
+        conversation_context = self._format_context_for_sql(context or [])
 
         logger.debug(
             f"[PROMPT] Building query prompt | "
             f"db_type={self.adapter.db_type} | "
             f"schema_chunks={len(schema_chunks)} | "
-            f"has_history={bool(attempt_history)}"
+            f"context_turns={len(context) if context else 0} | "
+            f"has_retry_history={bool(attempt_history)}"
         )
-        logger.debug(f"[PROMPT] Schema context:\n{schema_context[:500]}")
 
         if self.adapter.db_type == "mysql":
             user_content = _SQL_USER_TEMPLATE.format(
                 db_context=cfg.db_context_markdown,
                 schema_context=schema_context,
+                conversation_context=conversation_context,
                 attempt_history=history_text,
                 question=question,
             )
-            return {
-                "system": cfg.sql_system_prompt,
-                "user": user_content,
-            }
+            return {"system": cfg.sql_system_prompt, "user": user_content}
 
-        # MongoDB path — no static DB context (schema is inferred at runtime)
+        # MongoDB
         user_content = _MONGO_USER_TEMPLATE.format(
             schema_context=schema_context,
+            conversation_context=conversation_context,
             attempt_history=history_text,
             question=question,
         )
-        return {
-            "system": cfg.sql_system_prompt,  # same safety rules apply
-            "user": user_content,
-        }
+        return {"system": cfg.sql_system_prompt, "user": user_content}
 
     # ── NL answer generation ──────────────────────────────────────────────────
 
@@ -206,36 +265,32 @@ class PromptBuilder:
         quality: str = "small",
         sql_query: str = "",
         context: list[dict] | None = None,
+        pagination_offset: int = 0,
     ) -> dict[str, str]:
         """
         Build the natural language answer generation prompt.
 
-        Returns {"system": ..., "user": ...}.
-
         Args:
-            question:   The original user question.
-            rows:       Result rows from the DB (may be large).
-            row_count:  Total number of rows returned.
-            quality:    Result quality signal — 'small' | 'large' | 'empty' |
-                        'all_null' | 'low_relevance'
-            sql_query:  The actual SQL/Mongo query that ran.
-            context:    Last N conversation turns for multi-turn context.
-                        Each turn: {"question": ..., "sql": ..., "answer": ...}
+            question:          The original user question.
+            rows:              Result rows from the DB (already sliced to MAX_ROWS_FOR_LLM).
+            row_count:         Total rows returned.
+            quality:           'small' | 'large' | 'pagination' | 'empty' | 'all_null' | 'low_relevance'
+            sql_query:         The actual SQL/Mongo query that ran.
+            context:           Prior conversation turns.
+            pagination_offset: How many rows were already shown (for pagination quality text).
         """
         from core.config.settings import get_settings
         cfg = get_client_config()
         max_for_llm = get_settings().MAX_ROWS_FOR_LLM
+        page_size = get_settings().PAGE_SIZE
 
-        # Cap rows sent to LLM (full result set is still in the API response)
         preview_rows = rows[:max_for_llm]
 
-        # Strip embedding columns — they are huge vectors, not human-readable
         cleaned = [
             {k: v for k, v in row.items() if "embed" not in k.lower()}
             for row in preview_rows
         ]
 
-        # Format as JSON for readability (better than Python repr)
         try:
             results_preview = json.dumps(cleaned, indent=2, default=str)
         except Exception:
@@ -243,17 +298,23 @@ class PromptBuilder:
 
         if row_count > max_for_llm:
             results_preview += (
-                f"\n\n(Showing {max_for_llm} of {row_count} total rows. "
-                f"The user can see all {row_count} rows in the results table.)"
+                f"\n\n(Showing {max_for_llm} of {row_count} total rows.)"
             )
 
+        # Format quality instruction with pagination numbers where needed
         _raw_instruction = _QUALITY_INSTRUCTIONS.get(quality, _QUALITY_INSTRUCTIONS["small"])
-        quality_instruction = _raw_instruction.format(
-            total_rows=row_count,
-            page_size=get_settings().PAGE_SIZE,
-        ) if "{total_rows}" in _raw_instruction else _raw_instruction
 
-        # Sliding window conversation context (hard cap at 5 turns)
+        if "{total_rows}" in _raw_instruction:
+            quality_instruction = _raw_instruction.format(
+                total_rows=row_count,
+                page_size=page_size,
+                offset_start=pagination_offset + 1,
+                offset_end=pagination_offset + len(preview_rows),
+            )
+        else:
+            quality_instruction = _raw_instruction
+
+        # Sliding window conversation context
         context_text = ""
         if context:
             lines = ["Previous conversation turns (for context only — do not repeat these answers):"]
@@ -282,13 +343,11 @@ class PromptBuilder:
             f"context_turns={len(context) if context else 0}"
         )
 
-        return {
-            "system": cfg.answer_system_prompt,
-            "user": user_content,
-        }
+        return {"system": cfg.answer_system_prompt, "user": user_content}
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _format_history(self, history: list) -> str:
-        """Format retry attempt history for inclusion in the prompt."""
         if not history:
             return "None"
         lines = []
@@ -299,3 +358,42 @@ class PromptBuilder:
                 f"  Error received: {attempt.error}"
             )
         return "\n\n".join(lines)
+
+    def _format_context_for_sql(self, context: list[dict]) -> str:
+        """
+        Format prior conversation turns for injection into the SQL generation prompt.
+
+        Includes BOTH the question AND the SQL so the LLM understands what it
+        was querying before. This is critical for follow-up queries to work correctly.
+        The answer is intentionally excluded — it's verbose and irrelevant to SQL gen.
+        """
+        if not context:
+            return "(First message — no prior conversation turns)"
+
+        lines = ["The user has been asking questions in this session. Here are the prior turns:"]
+        for i, turn in enumerate(context[-5:], 1):
+            q = turn.get("question", "").strip()
+            sql = turn.get("sql", "").strip()
+            if q:
+                lines.append(f"  Turn {i}: User asked: \"{q}\"")
+            if sql:
+                lines.append(f"           SQL executed: {sql}")
+
+        lines.append("")
+        lines.append("Use this context to understand what the user is referring to.")
+        lines.append("If the current question is a follow-up, build on the previous SQL.")
+
+        return "\n".join(lines)
+
+    def _get_last_sql(self, context: list[dict]) -> str | None:
+        """
+        Extract the most recent non-empty SQL from the conversation context.
+
+        Iterates from newest to oldest to find the last query that actually ran.
+        Returns None if no SQL is found (caller falls back to normal prompt).
+        """
+        for turn in reversed(context):
+            sql = turn.get("sql", "").strip()
+            if sql:
+                return sql
+        return None
