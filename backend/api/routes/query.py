@@ -2,33 +2,28 @@
 api/routes/query.py
 Dev 3 owns this file.
 
-"""
-
-from fastapi import APIRouter, Depends, HTTPException, Header
-from api.schemas import QueryRequest, QueryResponse
-
-SSE streaming endpoint for NL → SQL queries.
+SSE streaming endpoint for NL to SQL queries.
 
 STREAM EVENT PROTOCOL:
     1.  {status: "thinking", done: false}
-        → Sent immediately so UI shows spinner while pipeline runs
+        Sent immediately so UI shows spinner while pipeline runs
 
     2.  {chunk: " word", done: false}
-        → Answer text tokens, one per word (simulated streaming)
+        Answer text tokens, one per word (simulated streaming)
 
     3.  {
           question, sql, results, all_results, row_count, total_rows,
           page_size, strategy_used, error, done: true
         }
-        → Final event. results = first PAGE_SIZE rows. all_results = all rows.
-          Frontend uses all_results for client-side "show more" pagination.
+        Final event. results = first PAGE_SIZE rows. all_results = all rows.
+        Frontend uses all_results for client-side "show more" pagination.
 
 CONVERSATIONAL "SHOW MORE":
     When user types "show more", it flows through the normal pipeline.
     The conversation context includes the previous SQL and pagination info
     ("Showing 10 of 47 results"). The LLM sees this and generates:
         SELECT ... LIMIT 10 OFFSET 10
-    No special-casing needed — works through existing pipeline.
+    No special-casing needed -- works through existing pipeline.
 """
 
 from fastapi import APIRouter, Depends, Header
@@ -49,12 +44,11 @@ from datetime import datetime, timezone
 from typing import Optional
 
 router = APIRouter()
-
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 settings = get_settings()
 
 
-# ─── Conversational system prompt ─────────────────────────────────────────────
+# ─── Conversational helpers ───────────────────────────────────────────────────
 
 def _build_conversational_system_prompt() -> str:
     """
@@ -70,37 +64,35 @@ def _build_conversational_system_prompt() -> str:
             f"Your tone is {cfg.tone}. "
             f"Keep responses concise and friendly. "
             f"Do not make up data or answer questions outside your scope. "
-            f"If asked what you can do, focus on data and analytics topics "
+            f"If asked what you can do or your services, list the some example queries and what kind of insights you can fetch from {cfg.db_context_structured}."
             f"relevant to {cfg.company_name}."
         )
     except Exception:
         return "You are a helpful data analytics assistant. Respond concisely."
- 
- 
+
+
 def _build_help_answer() -> str:
     """
     Build a structured HELP response from ClientConfig without calling the LLM.
- 
+
     Formats comma-separated scope descriptions as bullet lists so the
     response is readable rather than one long paragraph.
- 
+
     Falls back to a safe generic message if ClientConfig is unavailable.
     """
     try:
         cfg = get_client_config()
- 
+
         lines = [
             f"Hi! I'm **{cfg.assistant_name}**, your data assistant for "
             f"**{cfg.company_name}**.",
             "",
         ]
- 
-        # Business description — shown as a plain paragraph
+
         if cfg.business_description:
             lines.append(cfg.business_description.strip())
             lines.append("")
- 
-        # In-scope — split on commas and render as bullet list
+
         if cfg.in_scope_description:
             lines.append("**Here's what I can help you with:**")
             items = [
@@ -111,8 +103,7 @@ def _build_help_answer() -> str:
             for item in items:
                 lines.append(f"- {item}")
             lines.append("")
- 
-        # Out-of-scope — split on commas and render as bullet list
+
         if cfg.out_of_scope_description:
             lines.append("**What I can't help with:**")
             items = [
@@ -123,8 +114,7 @@ def _build_help_answer() -> str:
             for item in items:
                 lines.append(f"- {item}")
             lines.append("")
- 
-        # Closing example prompts
+
         lines.append(
             f"Just ask me a question and I'll query the **{cfg.db_name}** "
             "database and give you an answer. For example:"
@@ -132,9 +122,9 @@ def _build_help_answer() -> str:
         lines.append('- *"Show me the top 10 customers by revenue"*')
         lines.append('- *"How many orders were placed last month?"*')
         lines.append('- *"Which products have the highest profit margin?"*')
- 
+
         return "\n".join(lines)
- 
+
     except Exception:
         return (
             "I'm a data analytics assistant. I can help you query your "
@@ -142,16 +132,16 @@ def _build_help_answer() -> str:
             "Try asking something like \"Show me the top customers\" or "
             "\"How many orders were placed this month?\""
         )
-    
-# ─── Query route ──────────────────────────────────────────────────────────────
-logger = get_logger(__name__)
-settings = get_settings()
 
+
+# ─── SSE helper ───────────────────────────────────────────────────────────────
 
 def _sse(payload: dict) -> str:
     """Format a dict as a single SSE data line."""
     return f"data: {json.dumps(payload, default=str)}\n\n"
 
+
+# ─── Query route ──────────────────────────────────────────────────────────────
 
 @router.post("/query")
 async def run_query(
@@ -175,7 +165,7 @@ async def run_query(
                     question=question,
                     llm=service.llm,
                     use_llm_fallback=settings.INTENT_LLM_FALLBACK,
-                    context=body.context or [],   # ← pass conversation history
+                    context=body.context or [],
                 )
             except Exception:
                 logger.exception("[STREAM] Intent classification failed")
@@ -188,17 +178,6 @@ async def run_query(
         # ── 2. HELP intent — answer from ClientConfig, no LLM call needed ─────
         if intent == IntentType.HELP:
             answer = _build_help_answer()
-
-            payload = {
-                "question": question,
-                "sql": "",
-                "results": [],
-                "row_count": 0,
-                "strategy_used": "chat",
-                "answer": answer,
-                "error": None,
-                "done": True,
-            }
             append_to_history({
                 "id": str(uuid.uuid4()),
                 "question": question,
@@ -208,7 +187,19 @@ async def run_query(
                 "answer": answer,
                 "created_at": now,
             })
-            yield f"data: {json.dumps(payload)}\n\n"
+            yield _sse({
+                "question": question,
+                "sql": "",
+                "results": [],
+                "all_results": [],
+                "row_count": 0,
+                "total_rows": 0,
+                "page_size": page_size,
+                "strategy_used": "chat",
+                "answer": answer,
+                "error": None,
+                "done": True,
+            })
             return
 
         # ── 3. Greeting / Chat / Farewell — LLM with in-character system prompt
@@ -216,16 +207,11 @@ async def run_query(
             system_prompt = _build_conversational_system_prompt()
             conversational_prompt = (
                 f"{system_prompt}\n\n"
-        # ── 2. Conversational response ────────────────────────────────────────
-        if intent in {IntentType.GREETING, IntentType.CHAT, IntentType.HELP, IntentType.FAREWELL}:
-            conversational_prompt = (
-                "You are a helpful assistant. Respond conversationally and concisely.\n\n"
                 f"User: {question}"
             )
             try:
                 answer = service.llm.generate(conversational_prompt)
             except Exception:
-                answer = "I'm here to help with your data questions. What would you like to know?"
                 logger.exception("[STREAM] Conversational LLM call failed")
                 answer = "I'm here to help! What would you like to know?"
 
@@ -234,21 +220,11 @@ async def run_query(
                 "question": question,
                 "sql": "",
                 "strategy_used": f"INTENT_{intent.value}",
-                "strategy_used": "chat",
                 "row_count": 0,
                 "answer": answer,
                 "created_at": now,
             })
 
-        # ── 4. Ambiguous ──────────────────────────────────────────────────────
-        if intent == IntentType.AMBIGUOUS:
-            answer = (
-                "I'm not sure if this is a database-related request. "
-                "Could you please clarify? For example: "
-                "\"Show me orders from last month\" or "
-                "\"How many products are in stock?\""
-            )
-            payload = {
             # Stream answer word by word, then done
             words = answer.split(" ")
             for i, word in enumerate(words):
@@ -269,11 +245,12 @@ async def run_query(
             })
             return
 
-        # ── 3. Ambiguous ──────────────────────────────────────────────────────
+        # ── 4. Ambiguous ──────────────────────────────────────────────────────
         if intent == IntentType.AMBIGUOUS:
             answer = (
                 "I'm not sure if this is a database question. "
-                "Could you rephrase it? For example: 'Show me the top 10 customers by revenue.'"
+                "Could you rephrase it? For example: "
+                "'Show me the top 10 customers by revenue.'"
             )
             append_to_history({
                 "id": str(uuid.uuid4()),
@@ -299,8 +276,6 @@ async def run_query(
             return
 
         # ── 5. DB Query — yield "thinking" then run the pipeline ──────────────
-        yield f"data: {json.dumps({'status': 'thinking', 'done': False})}\n\n"
-        # ── 4. DB query ───────────────────────────────────────────────────────
         # Yield thinking indicator immediately so UI doesn't freeze
         yield _sse({"status": "thinking", "done": False})
 
@@ -378,23 +353,20 @@ async def run_query(
             except Exception as e:
                 logger.warning(f"[STREAM] Failed to persist messages: {e}")
 
-        # Stream answer word by word
         # ── Stream answer word by word ────────────────────────────────────────
         words = result.answer.split(" ")
         for i, word in enumerate(words):
             chunk = word if i == 0 else " " + word
             yield _sse({"chunk": chunk, "done": False})
 
-        # Final done event with full metadata
-        payload = {
         # ── Final done event with ALL data ────────────────────────────────────
-        # results = first page (what LLM described in answer)
+        # results    = first page (what LLM described in answer)
         # all_results = every row fetched (for client-side show more)
         yield _sse({
             "question": result.question,
             "sql": result.sql,
-            "results": first_page,           # first PAGE_SIZE rows
-            "all_results": all_results,       # all rows up to MAX_DB_FETCH_ROWS
+            "results": first_page,
+            "all_results": all_results,
             "row_count": len(first_page),
             "total_rows": total_rows,
             "page_size": page_size,
@@ -409,6 +381,6 @@ async def run_query(
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",       # disable nginx buffering
+            "X-Accel-Buffering": "no",   # disable nginx buffering
         },
     )

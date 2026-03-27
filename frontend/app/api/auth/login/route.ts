@@ -22,8 +22,11 @@ export async function POST(req: NextRequest) {
     const token = await signToken({ id: userId, email: user.email, name: user.name })
     await setSessionCookie(token)
 
+    // Return token in body so auth-context can store it in localStorage
+    // (same pattern as signup route — required for proxyFetch Authorization header)
     return NextResponse.json({
       user: { id: userId, email: user.email, name: user.name },
+      token,
     })
 
   } catch (err) {

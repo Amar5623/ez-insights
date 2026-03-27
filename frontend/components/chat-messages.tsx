@@ -25,14 +25,20 @@ import {
 // Parses the LLM answer into segments: markdown tables → <table>, rest → <p>
 // No external library needed.
 
-function parseMarkdownTable(block: string): { headers: string[]; rows: string[][] } | null {
+function parseMarkdownTable(
+  block: string,
+): { headers: string[]; rows: string[][] } | null {
   const lines = block.trim().split('\n').filter(l => l.trim())
   if (lines.length < 2) return null
   const isSeparator = (l: string) => /^\|?[\s\-|:]+\|?$/.test(l.trim())
   if (!isSeparator(lines[1])) return null
 
   const parseRow = (l: string) =>
-    l.trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim())
+    l
+      .trim()
+      .replace(/^\||\|$/g, '')
+      .split('|')
+      .map(c => c.trim())
 
   const headers = parseRow(lines[0])
   const rows = lines.slice(2).map(parseRow)
@@ -41,7 +47,10 @@ function parseMarkdownTable(block: string): { headers: string[]; rows: string[][
 
 function MarkdownTable({ block }: { block: string }) {
   const parsed = parseMarkdownTable(block)
-  if (!parsed) return <p className="text-sm leading-relaxed whitespace-pre-wrap">{block}</p>
+  if (!parsed)
+    return (
+      <p className="text-sm leading-relaxed whitespace-pre-wrap">{block}</p>
+    )
 
   const { headers, rows } = parsed
 
@@ -52,7 +61,10 @@ function MarkdownTable({ block }: { block: string }) {
           <thead>
             <tr className="border-b border-border bg-muted/70">
               {headers.map((h, i) => (
-                <th key={i} className="whitespace-nowrap px-4 py-3 text-left font-semibold text-foreground">
+                <th
+                  key={i}
+                  className="whitespace-nowrap px-4 py-3 text-left font-semibold text-foreground"
+                >
                   {h}
                 </th>
               ))}
@@ -60,9 +72,15 @@ function MarkdownTable({ block }: { block: string }) {
           </thead>
           <tbody>
             {rows.map((row, i) => (
-              <tr key={i} className="border-b border-border/50 last:border-0 transition-colors hover:bg-muted/30">
+              <tr
+                key={i}
+                className="border-b border-border/50 last:border-0 transition-colors hover:bg-muted/30"
+              >
                 {row.map((cell, j) => (
-                  <td key={j} className="whitespace-nowrap px-4 py-2.5 text-muted-foreground">
+                  <td
+                    key={j}
+                    className="whitespace-nowrap px-4 py-2.5 text-muted-foreground"
+                  >
                     {cell}
                   </td>
                 ))}
@@ -77,7 +95,6 @@ function MarkdownTable({ block }: { block: string }) {
 
 // Splits answer text into table blocks and text blocks, renders each correctly
 function MarkdownAnswer({ content }: { content: string }) {
-  // Split on markdown table blocks (lines starting with |)
   const segments = content.split(/((?:^\|.+\n?)+)/m)
 
   return (
@@ -85,26 +102,29 @@ function MarkdownAnswer({ content }: { content: string }) {
       {segments.map((segment, i) => {
         if (!segment.trim()) return null
         const lines = segment.trim().split('\n')
-        const looksLikeTable = lines.length >= 2 && lines[0].trim().startsWith('|')
+        const looksLikeTable =
+          lines.length >= 2 && lines[0].trim().startsWith('|')
 
         if (looksLikeTable) {
           return <MarkdownTable key={i} block={segment} />
         }
 
-        // Plain text — render with basic formatting
         return (
           <div key={i} className="text-sm leading-relaxed">
             {segment.split('\n').map((line, j) => {
               if (!line.trim()) return <br key={j} />
 
-              // Bold: **text**
               const parts = line.split(/(\*\*[^*]+\*\*)/g)
               return (
                 <p key={j} className="my-0.5">
                   {parts.map((part, k) =>
-                    part.startsWith('**') && part.endsWith('**')
-                      ? <strong key={k} className="font-semibold text-foreground">{part.slice(2, -2)}</strong>
-                      : part
+                    part.startsWith('**') && part.endsWith('**') ? (
+                      <strong key={k} className="font-semibold text-foreground">
+                        {part.slice(2, -2)}
+                      </strong>
+                    ) : (
+                      part
+                    ),
                   )}
                 </p>
               )
@@ -137,20 +157,23 @@ function LoadingBubble() {
 }
 
 // ── MessageBubble ──────────────────────────────────────────────────────────────
-function MessageBubble({ message, index }: { message: ChatMessage; index: number }) {
+function MessageBubble({
+  message,
+  index,
+}: {
+  message: ChatMessage
+  index: number
+}) {
   const isUser = message.role === 'user'
 
-  // Show loading bubble only when isLoading AND no content yet (first chunk not arrived)
+  // Show loading bubble only when isLoading AND no content yet
   if (message.isLoading && !message.content) {
     return <LoadingBubble />
   }
 
   return (
     <div
-      className={cn(
-        'flex gap-3 animate-fade-in-up',
-        isUser && 'flex-row-reverse'
-      )}
+      className={cn('flex gap-3 animate-fade-in-up', isUser && 'flex-row-reverse')}
       style={{ animationDelay: `${index * 50}ms` }}
     >
       <div
@@ -158,7 +181,7 @@ function MessageBubble({ message, index }: { message: ChatMessage; index: number
           'flex h-9 w-9 shrink-0 items-center justify-center rounded-xl transition-transform duration-300 hover:scale-105',
           isUser
             ? 'bg-primary shadow-md shadow-primary/25'
-            : 'bg-gradient-to-br from-primary/20 to-primary/10 ring-2 ring-primary/20'
+            : 'bg-gradient-to-br from-primary/20 to-primary/10 ring-2 ring-primary/20',
         )}
       >
         {isUser ? (
@@ -171,7 +194,7 @@ function MessageBubble({ message, index }: { message: ChatMessage; index: number
       <div
         className={cn(
           'flex max-w-[80%] flex-col gap-2',
-          isUser && 'items-end'
+          isUser && 'items-end',
         )}
       >
         <div
@@ -179,7 +202,7 @@ function MessageBubble({ message, index }: { message: ChatMessage; index: number
             'rounded-2xl px-4 py-3 shadow-sm transition-all duration-300',
             isUser
               ? 'bg-primary text-primary-foreground shadow-primary/20'
-              : 'bg-card border border-border text-foreground'
+              : 'bg-card border border-border text-foreground',
           )}
         >
           {isUser ? (
@@ -234,6 +257,7 @@ export function ChatMessages({ sidebarOpen }: { sidebarOpen: boolean }) {
   const { currentChat, isLoading, sendMessage } = useChat()
   const viewportRef = useRef<HTMLDivElement>(null)
 
+  // Auto-scroll to bottom whenever messages change
   useEffect(() => {
     if (!viewportRef.current) return
     viewportRef.current.scrollTop = viewportRef.current.scrollHeight
@@ -269,8 +293,8 @@ export function ChatMessages({ sidebarOpen }: { sidebarOpen: boolean }) {
             Welcome to Ez-Insights
           </h2>
           <p className="text-muted-foreground leading-relaxed">
-            Ask questions about your database in plain English. I'll translate
-            them into SQL queries and show you the results instantly.
+            Ask questions about your database in plain English. I&apos;ll
+            translate them into SQL queries and show you the results instantly.
           </p>
           <div className="mt-8 flex flex-wrap justify-center gap-2">
             {SUGGESTION_CHIPS.map((text, i) => (
@@ -292,6 +316,7 @@ export function ChatMessages({ sidebarOpen }: { sidebarOpen: boolean }) {
 
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
+      {/* Compact header shown when sidebar is collapsed */}
       {!sidebarOpen && (
         <div className="flex items-center gap-3 border-b border-border px-6 py-3 bg-background/80 backdrop-blur-sm animate-fade-in">
           <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-gradient-to-br from-primary/20 to-primary/5 ring-2 ring-primary/10">
@@ -309,7 +334,10 @@ export function ChatMessages({ sidebarOpen }: { sidebarOpen: boolean }) {
             ))}
           </div>
         </ScrollAreaPrimitive.Viewport>
-        <ScrollAreaPrimitive.Scrollbar orientation="vertical" className="flex touch-none select-none transition-colors h-full w-2.5 border-l border-l-transparent p-[1px]">
+        <ScrollAreaPrimitive.Scrollbar
+          orientation="vertical"
+          className="flex touch-none select-none transition-colors h-full w-2.5 border-l border-l-transparent p-px"
+        >
           <ScrollAreaPrimitive.Thumb className="relative flex-1 rounded-full bg-border" />
         </ScrollAreaPrimitive.Scrollbar>
       </ScrollAreaPrimitive.Root>
