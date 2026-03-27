@@ -1,0 +1,294 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# client-configs/classicmodels/db_context.yaml
+#
+# Rich database context for the classicmodels schema.
+# This file does two jobs:
+#
+#   1. STATIC INJECTION — injected into every SQL generation user message as
+#      a "persistent schema knowledge" block. The LLM always sees this.
+#
+#   2. SEMANTIC INDEXING — each table entry is embedded by SchemaRetriever
+#      at startup as an ENRICHED chunk alongside the raw DESCRIBE output.
+#      This gives FAISS rich business context to match against user questions,
+#      not just column names and types.
+#
+# WHY THIS EXISTS:
+#   SHOW TABLES + DESCRIBE gives the LLM column names and types.
+#   It tells it NOTHING about:
+#     - What valid values a column can hold ("Shipped", "In Process", etc.)
+#     - What a column means in business terms (priceEach ≠ MSRP ≠ buyPrice)
+#     - How to JOIN tables correctly
+#     - What "revenue" means computationally in this schema
+#
+#   Without this context the LLM writes plausible-looking SQL that is
+#   semantically wrong — wrong status filters, wrong revenue computation,
+#   wrong JOIN paths. This file fixes that.
+#
+# FORMAT:
+#   tables:
+#     <table_name>:
+#       description: one paragraph, plain English
+#       key_columns:
+#         <column_name>:
+#           description: what it means
+#           valid_values: [list] or omit if free-form
+#           notes: any gotchas
+#       join_notes: how this table connects to others
+#       common_queries: examples of what users typically ask about this table
+# ═══════════════════════════════════════════════════════════════════════════════
+
+database_name: classicmodels
+database_type: mysql
+
+# ─── Safe Views ───────────────────────────────────────────────────────────────
+# Use these instead of raw tables when PII is a concern.
+safe_views:
+  safe_customers:
+    replaces: customers
+    excludes_columns: [cvv, card_number, card_expiry, upi_id, account_number, ifsc_code, creditLimit]
+    use_when: "any customer query that doesn't require payment credential fields"
+
+  safe_payments:
+    replaces: payments
+    excludes_columns: [checkNumber, upi_id, account_number, ifsc_code, card_number, cvv, card_expiry]
+    use_when: "any payment query — always prefer this over raw payments table"
+
+# ─── Tables ───────────────────────────────────────────────────────────────────
+
+tables:
+
+  customers:
+    description: >
+      B2B customer master. Each row is a business customer (company), not an individual.
+      customerName is the company name. contactFirstName/contactLastName is the human
+      point-of-contact at that company. salesRepEmployeeNumber links to the assigned
+      sales rep in the employees table — NULL means no rep is assigned.
+    key_columns:
+      customerNumber:
+        description: "Unique integer ID for the customer. Primary key."
+      customerName:
+        description: "The company/business name. Not an individual's name."
+      salesRepEmployeeNumber:
+        description: "FK to employees.employeeNumber. NULL = no rep assigned. Use IS NULL / IS NOT NULL."
+      creditLimit:
+        description: "Approved credit ceiling in USD. Sensitive — excluded from safe_customers view."
+      payment_method:
+        description: "Primary payment method used by this customer."
+        valid_values: ["UPI", "NEFT", "CHECK"]
+      country:
+        description: "Country of the customer's business."
+      state:
+        description: "State/province. NULL for non-US customers — always use IS NULL check."
+    join_notes: >
+      customers → orders (ON customers.customerNumber = orders.customerNumber)
+      customers → payments (ON customers.customerNumber = payments.customerNumber)
+      customers → employees (ON customers.salesRepEmployeeNumber = employees.employeeNumber)
+    common_queries:
+      - "top customers by total payments or revenue"
+      - "customers without a sales rep assigned"
+      - "customers by country or territory"
+      - "customers with no orders"
+
+  orders:
+    description: >
+      Order headers. One row per order. Contains dates and status — NOT revenue.
+      Revenue must always be computed from orderdetails: SUM(quantityOrdered * priceEach).
+      Never use orders alone for revenue calculations — the revenue columns do not exist here.
+    key_columns:
+      orderNumber:
+        description: "Unique order identifier. Primary key."
+      orderDate:
+        description: "Date the order was placed. Use for trend analysis, time filtering."
+      requiredDate:
+        description: "Date the customer needs delivery by."
+      shippedDate:
+        description: >
+          Date the order was actually shipped. NULL means the order has not shipped yet.
+          Use IS NULL to find unshipped orders. Use shippedDate > requiredDate for late shipments.
+      status:
+        description: "Current state of the order."
+        valid_values:
+          - "Shipped"      # order has been fulfilled and dispatched
+          - "In Process"   # order is being prepared / active
+          - "On Hold"      # paused, awaiting resolution
+          - "Cancelled"    # voided order
+          - "Disputed"     # customer has raised a dispute
+          - "Resolved"     # dispute has been closed
+      customerNumber:
+        description: "FK to customers.customerNumber."
+    join_notes: >
+      orders → customers (ON orders.customerNumber = customers.customerNumber)
+      orders → orderdetails (ON orders.orderNumber = orderdetails.orderNumber)
+    common_queries:
+      - "recent orders / orders this month"
+      - "overdue or late orders (shippedDate > requiredDate OR shippedDate IS NULL AND requiredDate < CURDATE())"
+      - "orders by status"
+      - "order count per customer"
+
+  orderdetails:
+    description: >
+      Order line items. One row per product per order. This is where revenue lives.
+      Revenue = SUM(quantityOrdered * priceEach). Profit = SUM((priceEach - buyPrice) * quantityOrdered)
+      where buyPrice comes from the products table joined on productCode.
+      This table is the heart of all financial analysis.
+    key_columns:
+      orderNumber:
+        description: "FK to orders.orderNumber. Part of composite PK."
+      productCode:
+        description: "FK to products.productCode. Part of composite PK."
+      quantityOrdered:
+        description: "Number of units ordered for this line item."
+      priceEach:
+        description: >
+          Actual sale price per unit at time of order. This is NOT the same as
+          products.MSRP (list price) or products.buyPrice (cost price).
+          Always use THIS column for revenue calculations, not MSRP.
+      orderLineNumber:
+        description: "Line item sequence number within the order."
+    join_notes: >
+      orderdetails → orders (ON orderdetails.orderNumber = orders.orderNumber)
+      orderdetails → products (ON orderdetails.productCode = products.productCode)
+    common_queries:
+      - "total revenue (SUM of quantityOrdered * priceEach)"
+      - "top selling products by quantity or revenue"
+      - "revenue by product line (needs JOIN to products → productlines)"
+      - "profit margin analysis"
+
+  products:
+    description: >
+      Product catalogue. One row per SKU. Three price points exist: buyPrice (cost
+      to company), MSRP (manufacturer suggested retail), and priceEach in orderdetails
+      (actual sale price — varies per order). productCode prefix encodes scale:
+      S10=1:10, S12=1:12, S18=1:18, S24=1:24, S32=1:32, S50=1:50.
+    key_columns:
+      productCode:
+        description: "Unique SKU identifier. Prefix encodes scale (S18_ = 1:18 scale)."
+      productName:
+        description: "Full product name."
+      productLine:
+        description: "Category FK to productlines.productLine."
+        valid_values: ["Classic Cars", "Motorcycles", "Planes", "Ships", "Trains", "Trucks and Buses", "Vintage Cars"]
+      productScale:
+        description: "Model scale ratio as string e.g. '1:18', '1:24'."
+      buyPrice:
+        description: "Company's cost price per unit. Used for profit margin calculations."
+      MSRP:
+        description: "Manufacturer suggested retail price. NOT the actual sale price."
+      quantityInStock:
+        description: "Current inventory level. Use for stock analysis."
+    join_notes: >
+      products → productlines (ON products.productLine = productlines.productLine)
+      products → orderdetails (ON products.productCode = orderdetails.productCode)
+    common_queries:
+      - "low stock products (quantityInStock < threshold)"
+      - "most/least profitable products"
+      - "products by product line"
+      - "products never ordered"
+
+  productlines:
+    description: >
+      7 product categories. Join to products on productLine for category-level analysis.
+    key_columns:
+      productLine:
+        description: "Category name. Primary key."
+        valid_values: ["Classic Cars", "Motorcycles", "Planes", "Ships", "Trains", "Trucks and Buses", "Vintage Cars"]
+      textDescription:
+        description: "Marketing description of the product line."
+    common_queries:
+      - "revenue by product line"
+      - "best selling product line"
+      - "product count per category"
+
+  employees:
+    description: >
+      All staff including Sales Reps and their managers. Self-referential hierarchy via
+      reportsTo FK (employee's manager's employeeNumber). NULL reportsTo = President (top of org).
+      Sales Reps are linked to customers via customers.salesRepEmployeeNumber.
+    key_columns:
+      employeeNumber:
+        description: "Unique integer ID. Primary key."
+      firstName:
+        description: "Employee first name."
+      lastName:
+        description: "Employee last name."
+      jobTitle:
+        description: "Role."
+        valid_values: ["President", "VP Sales", "VP Marketing", "Sales Manager (APAC)", "Sale Manager (EMEA)", "Sales Manager (NA)", "Sales Rep"]
+      reportsTo:
+        description: >
+          FK to employees.employeeNumber — the direct manager.
+          NULL means this employee reports to no one (President).
+          For org hierarchy queries: self-join or WITH RECURSIVE.
+      officeCode:
+        description: "FK to offices.officeCode — the office this employee works from."
+    join_notes: >
+      employees → offices (ON employees.officeCode = offices.officeCode)
+      employees → customers (ON employees.employeeNumber = customers.salesRepEmployeeNumber)
+      employees self-join for hierarchy (e1.reportsTo = e2.employeeNumber)
+    common_queries:
+      - "sales rep performance (revenue generated via their customers)"
+      - "employees by office or territory"
+      - "manager's direct reports"
+      - "org chart / reporting hierarchy"
+
+  offices:
+    description: >
+      7 physical offices across 4 sales territories. Territory maps offices to regions.
+    key_columns:
+      officeCode:
+        description: "Unique office identifier. Primary key."
+      city:
+        description: "City where the office is located."
+      country:
+        description: "Country."
+      territory:
+        description: "Sales region this office belongs to."
+        valid_values: ["NA", "EMEA", "APAC", "Japan"]
+    join_notes: >
+      offices → employees (ON offices.officeCode = employees.officeCode)
+    common_queries:
+      - "revenue by territory (offices → employees → customers → orders → orderdetails)"
+      - "employee count per office"
+      - "offices in a specific territory"
+
+  payments:
+    description: >
+      Customer-level payment records. IMPORTANT: payments are NOT linked to specific
+      orders — they are customer-level settlements. Do not JOIN payments to orders.
+      Always use safe_payments view unless specifically instructed otherwise.
+    key_columns:
+      customerNumber:
+        description: "FK to customers.customerNumber. Part of composite PK."
+      checkNumber:
+        description: "Payment reference identifier. Sensitive — excluded from safe_payments view."
+      paymentDate:
+        description: "Date the payment was made."
+      amount:
+        description: "Payment amount in USD."
+    join_notes: >
+      payments → customers (ON payments.customerNumber = customers.customerNumber)
+      NOTE: No direct JOIN to orders — payments are not order-level.
+    common_queries:
+      - "total payments by customer"
+      - "payment method breakdown"
+      - "customers with highest total payments"
+      - "payments in a date range"
+
+# ─── FK Chain (complete join map) ────────────────────────────────────────────
+fk_chain: >
+  offices.officeCode → employees.officeCode
+  employees.employeeNumber (self-ref: reportsTo)
+  employees.employeeNumber → customers.salesRepEmployeeNumber
+  customers.customerNumber → orders.customerNumber
+  orders.orderNumber → orderdetails.orderNumber
+  orderdetails.productCode → products.productCode
+  products.productLine → productlines.productLine
+  customers.customerNumber → payments.customerNumber
+
+# ─── Common computed expressions ─────────────────────────────────────────────
+computed_expressions:
+  revenue: "SUM(od.quantityOrdered * od.priceEach)"
+  profit: "SUM((od.priceEach - p.buyPrice) * od.quantityOrdered)"
+  avg_order_value: "SUM(od.quantityOrdered * od.priceEach) / COUNT(DISTINCT o.orderNumber)"
+  late_orders: "shippedDate > requiredDate OR (shippedDate IS NULL AND requiredDate < CURDATE())"
+  active_customers: "customers with at least one order WHERE status != 'Cancelled'"

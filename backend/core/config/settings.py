@@ -148,6 +148,12 @@ class Settings(BaseSettings):
     SENSITIVE_TABLES: list[str] = ["customers", "payments"]   # override per client
     SENSITIVE_COLUMNS_EXTRA: list[str] = []                   # already existed, keep it
     SCRUB_EMAILS: bool = True
+
+    # ── Client config ─────────────────────────────────────────────────────────────
+    # Path to the client-specific configuration bundle.
+    # Set this to the folder for the current client deployment.
+    # Example: CLIENT_CONFIG_PATH=./client-configs/classicmodels
+    CLIENT_CONFIG_PATH: str = "./client-configs/classicmodels"
  
       
     class Config:
