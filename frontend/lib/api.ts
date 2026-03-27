@@ -1,15 +1,27 @@
+/**
+ * frontend/lib/api.ts
+ *
+ * All backend communication goes through /api/proxy/* routes.
+ * The proxy routes run on the Next.js server and add X-API-Key
+ * server-side — the API key never reaches the browser bundle.
+ *
+ * REMOVED: NEXT_PUBLIC_API_KEY, NEXT_PUBLIC_API_URL
+ * These were exposed in the JS bundle. Delete them from .env.local.
+ *
+ * ADDED to .env.local (server-only):
+ *   BACKEND_URL=http://localhost:8000
+ *   BACKEND_API_KEY=your-secret-key
+ */
+
 import type { QueryRequest, QueryResponse, HistoryItem, HealthResponse } from './types'
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
-const API_KEY = process.env.NEXT_PUBLIC_API_KEY || ''
-
-// JWT token — set by page.tsx on auth change
+// JWT token — set by page.tsx when auth state changes
 let _jwtToken: string | null = null
 export function setJwtToken(token: string | null) {
   _jwtToken = token
 }
 
-// Active chat context — set by chat-context.tsx on chat change
+// Active chat context — set by ChatProvider when active chat changes
 let _activeChatId: string | null = null
 let _activeUserId: string | null = null
 export function setActiveChatContext(chatId: string | null, userId: string | null) {
@@ -17,20 +29,17 @@ export function setActiveChatContext(chatId: string | null, userId: string | nul
   _activeUserId = userId
 }
 
-// ── Core fetch wrapper ────────────────────────────────────────────────────────
+// ── Core fetch wrapper (for non-streaming REST calls) ──────────────────────────
 
-async function fetchWithAuth(endpoint: string, options: RequestInit = {}) {
+async function proxyFetch(path: string, options: RequestInit = {}) {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
-    'X-API-Key': API_KEY,
     ...(options.headers as Record<string, string>),
   }
+  if (_jwtToken) headers['Authorization'] = `Bearer ${_jwtToken}`
 
-  if (_jwtToken) {
-    headers['Authorization'] = `Bearer ${_jwtToken}`
-  }
-
-  const response = await fetch(`${API_URL}${endpoint}`, {
+  // /api/proxy/... routes are handled by Next.js server which adds X-API-Key
+  const response = await fetch(`/api/proxy${path}`, {
     ...options,
     headers,
   })
@@ -43,27 +52,46 @@ async function fetchWithAuth(endpoint: string, options: RequestInit = {}) {
   return response.json()
 }
 
-// ── Query API ─────────────────────────────────────────────────────────────────
+// ── Streaming query ────────────────────────────────────────────────────────────
 
+export interface StreamCallbacks {
+  onChunk: (chunk: string) => void
+  onDone: (meta: Partial<QueryResponse>) => void
+  onError: (err: string) => void
+}
+
+/**
+ * Send a query and consume the SSE stream.
+ *
+ * Events received:
+ *   {status: "thinking", done: false}     → pipeline is running, show spinner
+ *   {chunk: " word",     done: false}     → answer text token, append to message
+ *   {done: true, results, all_results, sql, ...} → final event with all data
+ */
 export async function sendQuery(
   request: QueryRequest,
-  onChunk: (chunk: string) => void,
-  onDone: (meta: Partial<QueryResponse>) => void,
-  onError: (err: string) => void,
+  callbacks: StreamCallbacks,
 ): Promise<void> {
+  const { onChunk, onDone, onError } = callbacks
+
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
-    'X-API-Key': API_KEY,
   }
   if (_jwtToken) headers['Authorization'] = `Bearer ${_jwtToken}`
   if (_activeChatId) headers['X-Chat-Id'] = _activeChatId
   if (_activeUserId) headers['X-User-Id'] = _activeUserId
 
-  const response = await fetch(`${API_URL}/api/query`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(request),
-  })
+  let response: Response
+  try {
+    response = await fetch('/api/proxy/query', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(request),
+    })
+  } catch (err) {
+    onError('Network error — is the server running?')
+    return
+  }
 
   if (!response.ok || !response.body) {
     const err = await response.json().catch(() => ({ detail: 'Request failed' }))
@@ -78,47 +106,65 @@ export async function sendQuery(
   while (true) {
     const { done, value } = await reader.read()
     if (done) break
+
     buffer += decoder.decode(value, { stream: true })
 
-    const lines = buffer.split('\n')
-    buffer = lines.pop() ?? ''
+    // SSE lines are separated by \n\n — split and process complete events
+    const parts = buffer.split('\n\n')
+    buffer = parts.pop() ?? ''   // last part may be incomplete
 
-    for (const line of lines) {
-      if (!line.startsWith('data: ')) continue
-      const raw = line.slice(6).trim()
-      if (!raw) continue
-      try {
-        const event = JSON.parse(raw)
-        if (event.status === 'thinking') continue
-        if (event.chunk !== undefined) {
-          onChunk(event.chunk)
-        } else if (event.done && !event.chunk) {
-          onDone(event)
+    for (const part of parts) {
+      for (const line of part.split('\n')) {
+        if (!line.startsWith('data: ')) continue
+        const raw = line.slice(6).trim()
+        if (!raw) continue
+
+        let event: Record<string, unknown>
+        try {
+          event = JSON.parse(raw)
+        } catch {
+          continue  // skip malformed events
         }
-      } catch {
-        // ignore malformed
+
+        // "thinking" indicator — just a status ping, no data yet
+        if (event.status === 'thinking') continue
+
+        // Text token — append to streaming answer
+        if (event.chunk !== undefined) {
+          onChunk(event.chunk as string)
+          continue
+        }
+
+        // Final done event — contains all data
+        if (event.done === true) {
+          if (event.error) {
+            onError(event.error as string)
+          } else {
+            onDone(event as Partial<QueryResponse>)
+          }
+        }
       }
     }
   }
 }
 
-// ── History API (legacy) ──────────────────────────────────────────────────────
+// ── History API ────────────────────────────────────────────────────────────────
 
 export async function getHistory(limit: number = 20): Promise<HistoryItem[]> {
-  return fetchWithAuth(`/api/history?limit=${limit}`)
+  return proxyFetch(`/history?limit=${limit}`)
 }
 
 export async function deleteHistoryItem(id: string): Promise<{ deleted: boolean }> {
-  return fetchWithAuth(`/api/history/${id}`, { method: 'DELETE' })
+  return proxyFetch(`/history/${id}`, { method: 'DELETE' })
 }
 
-// ── Health API ────────────────────────────────────────────────────────────────
+// ── Health API ─────────────────────────────────────────────────────────────────
 
 export async function checkHealth(): Promise<HealthResponse> {
-  return fetchWithAuth('/api/health')
+  return proxyFetch('/health')
 }
 
-// ── Chat API ──────────────────────────────────────────────────────────────────
+// ── Chat API ───────────────────────────────────────────────────────────────────
 
 export interface ChatRecordAPI {
   id: string
@@ -141,11 +187,14 @@ export interface MessageRecordAPI {
 }
 
 export async function fetchChats(userId: string): Promise<ChatRecordAPI[]> {
-  return fetchWithAuth(`/api/chats?user_id=${encodeURIComponent(userId)}`)
+  return proxyFetch(`/chats?user_id=${encodeURIComponent(userId)}`)
 }
 
-export async function createChat(userId: string, title: string = 'New Chat'): Promise<ChatRecordAPI> {
-  return fetchWithAuth('/api/chats', {
+export async function createChat(
+  userId: string,
+  title: string = 'New Chat',
+): Promise<ChatRecordAPI> {
+  return proxyFetch('/chats', {
     method: 'POST',
     body: JSON.stringify({ user_id: userId, title }),
   })
@@ -156,21 +205,22 @@ export async function updateChatTitle(
   userId: string,
   title: string,
 ): Promise<void> {
-  await fetchWithAuth(
-    `/api/chats/${chatId}/title?user_id=${encodeURIComponent(userId)}&title=${encodeURIComponent(title)}`,
+  await proxyFetch(
+    `/chats/${chatId}/title?user_id=${encodeURIComponent(userId)}&title=${encodeURIComponent(title)}`,
     { method: 'PATCH' },
   )
 }
 
 export async function deleteChatAPI(chatId: string, userId: string): Promise<void> {
-  await fetchWithAuth(
-    `/api/chats/${chatId}?user_id=${encodeURIComponent(userId)}`,
+  await proxyFetch(
+    `/chats/${chatId}?user_id=${encodeURIComponent(userId)}`,
     { method: 'DELETE' },
   )
 }
 
-export async function fetchMessages(chatId: string, userId: string): Promise<MessageRecordAPI[]> {
-  return fetchWithAuth(
-    `/api/chats/${chatId}/messages?user_id=${encodeURIComponent(userId)}`,
-  )
+export async function fetchMessages(
+  chatId: string,
+  userId: string,
+): Promise<MessageRecordAPI[]> {
+  return proxyFetch(`/chats/${chatId}/messages?user_id=${encodeURIComponent(userId)}`)
 }

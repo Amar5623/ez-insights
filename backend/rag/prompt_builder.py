@@ -83,27 +83,23 @@ _QUALITY_INSTRUCTIONS: dict[str, str] = {
         "Format the data as a markdown table if there are 3+ columns or 3+ rows."
     ),
     "large": (
-        "The full result set has more rows than shown here. "
-        "Summarize the key insights from the sample shown. "
-        "Mention the total row count. Format as a markdown table. "
-        "Be specific — mention actual values from the top results."
+        "The query returned {total_rows} rows total. "
+        "Show the first {page_size} rows as a markdown table. "
+        "End with exactly this line: "
+        "'_Showing {page_size} of {total_rows} results. "
+        "Say **show more** to see the next {page_size}._'"
     ),
     "empty": (
         "No results were returned. Tell the user clearly that nothing was found. "
-        "Suggest one or two likely reasons: a filter value that doesn't match the data, "
-        "no records for that time period, or a possible typo in a name. "
-        "Offer a concrete rephrased question they could try next."
+        "Suggest likely reasons and offer a concrete rephrased question to try."
     ),
     "all_null": (
-        "The query returned rows but all values appear to be empty or null. "
-        "Tell the user the query ran but the data in those fields appears missing "
-        "or not yet populated. Suggest they try querying a different table or column."
+        "The query returned rows but all values appear empty or null. "
+        "Tell the user the data appears to be missing or not yet populated."
     ),
     "low_relevance": (
-        "These results may not directly answer the question. Be honest: briefly describe "
-        "what was actually returned, explain why it might not be the right data, "
-        "and suggest how the user could rephrase for a better result. "
-        "Do not fabricate an answer from unrelated data."
+        "These results may not answer the question. Be honest about what was "
+        "returned and suggest how to rephrase for a better result."
     ),
 }
 
@@ -251,9 +247,11 @@ class PromptBuilder:
                 f"The user can see all {row_count} rows in the results table.)"
             )
 
-        quality_instruction = _QUALITY_INSTRUCTIONS.get(
-            quality, _QUALITY_INSTRUCTIONS["small"]
-        )
+        _raw_instruction = _QUALITY_INSTRUCTIONS.get(quality, _QUALITY_INSTRUCTIONS["small"])
+        quality_instruction = _raw_instruction.format(
+            total_rows=row_count,
+            page_size=get_settings().PAGE_SIZE,
+        ) if "{total_rows}" in _raw_instruction else _raw_instruction
 
         # Sliding window conversation context (hard cap at 5 turns)
         context_text = ""

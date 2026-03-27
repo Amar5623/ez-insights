@@ -51,18 +51,6 @@ class MaxRetriesExceeded(Exception):
 
 @dataclass
 class QueryResponse:
-    """
-    The result returned by QueryService.run() and sent to the API layer.
-
-    Fields mirror api/schemas.py QueryResponse exactly so FastAPI can
-    serialise this dataclass directly via the response_model.
-
-    sql:          For MySQL — the SQL string.
-                  For MongoDB — the JSON query dict stringified.
-    strategy_used: Short name of the strategy that produced the result.
-    error:        None on success. Error message on failure (the route
-                  turns this into an HTTP 500).
-    """
     question: str
     sql: str
     results: list[dict]
@@ -70,6 +58,10 @@ class QueryResponse:
     strategy_used: str
     answer: str
     error: str | None = field(default=None)
+    # pagination fields (query_service populates these from settings)
+    total_rows: int = field(default=0)
+    page_size: int = field(default=10)
+    all_results: list[dict] = field(default_factory=list)
 
 
 # ─── Service ──────────────────────────────────────────────────────────────────
@@ -247,8 +239,11 @@ class QueryService:
         return QueryResponse(
             question=question,
             sql=strategy_result.query_used,
-            results=scrubbed_rows,
+            results=scrubbed_rows,         # all rows (used for all_results in route)
+            all_results=scrubbed_rows,     # same — route slices for first page
             row_count=strategy_result.row_count,
+            total_rows=strategy_result.row_count,
+            page_size=self._settings.PAGE_SIZE,
             strategy_used=strategy_result.strategy_name,
             answer=answer,
             error=None,
