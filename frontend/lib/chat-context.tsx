@@ -36,7 +36,7 @@ interface ChatContextType {
 
 const ChatContext = createContext<ChatContextType | null>(null)
 
-const CONTEXT_WINDOW_SIZE = 5
+const CONTEXT_WINDOW_SIZE = 15
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

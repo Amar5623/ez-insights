@@ -155,7 +155,7 @@ CHAT_PATTERNS = [
 ]
 
 DB_PATTERNS = [
-    r"\bshow\b", r"\blist\b", r"\bfind\b", r"\bget\b",
+    r"\blist\b", r"\bfind\b", r"\bget\b",
     r"\bretrieve\b", r"\bsearch\b", r"\bcount\b",
     r"\bhow many\b", r"\btotal\b",
     r"\borders?\b", r"\bproducts?\b", r"\busers?\b",

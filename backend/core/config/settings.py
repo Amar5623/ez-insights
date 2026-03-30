@@ -102,7 +102,7 @@ class Settings(BaseSettings):
     #   (Frontend reads it from the QueryResponse or uses the constant directly.)
     #
     MAX_DB_FETCH_ROWS: int = 100   # rows fetched from DB (was MAX_RESULT_ROWS)
-    MAX_ROWS_FOR_LLM: int = 15     # rows sent to LLM answer-generation prompt
+    MAX_ROWS_FOR_LLM: int = 10     # rows sent to LLM answer-generation prompt
     PAGE_SIZE: int = 10            # rows shown per page in the UI
 
     # Backward-compat alias — Dev 2's strategy files reference MAX_RESULT_ROWS.

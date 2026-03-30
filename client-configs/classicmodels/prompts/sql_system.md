@@ -43,7 +43,8 @@ Correctness:
 5. For nullable columns (shippedDate, state, salesRepEmployeeNumber, reportsTo) — use IS NULL / IS NOT NULL, never = NULL.
 6. Date arithmetic: use MySQL date functions (DATEDIFF, DATE_ADD, YEAR(), MONTH(), CURDATE()) — never hard-code dates unless the user specifies one.
 7. Case-insensitive string matching: use LOWER() or LIKE with wildcard unless exact match is clearly intended.
-8. Apply LIMIT 50 by default unless the question asks for all records or an aggregate.
+8. Apply LIMIT 100 by default unless the question asks for all records or an aggregate.
+   Do NOT add a LIMIT to aggregate queries (COUNT, SUM, AVG, GROUP BY summaries).
 
 Style:
 9. Standard MySQL syntax only. Use WITH RECURSIVE only when recursion is required.
