@@ -16,14 +16,19 @@ STREAM EVENT PROTOCOL:
           page_size, strategy_used, error, done: true
         }
         Final event. results = first PAGE_SIZE rows. all_results = all rows.
-        Frontend uses all_results for client-side "show more" pagination.
 
-CONVERSATIONAL "SHOW MORE":
-    When user types "show more", it flows through the normal pipeline.
-    The conversation context includes the previous SQL and pagination info
-    ("Showing 10 of 47 results"). The LLM sees this and generates:
-        SELECT ... LIMIT 10 OFFSET 10
-    No special-casing needed -- works through existing pipeline.
+PAGINATION:
+    When user types "show more", the intent classifier marks it as PAGINATION.
+    query.py reads body.displayed_count (sent by the frontend — how many rows
+    the user has already seen) and passes it to service.run().
+    query_service passes it to prompt_builder as pagination_offset.
+    prompt_builder builds a tight "take previous SQL, add LIMIT X OFFSET Y" prompt.
+    No regex scraping. No guessing. The offset is a plain integer from the client.
+
+HELP intent:
+    Handled without an LLM call — _build_help_answer() constructs the response
+    directly from ClientConfig. Greetings, chat, farewell use _build_conversational_system_prompt()
+    so responses are always in-character for the client deployment.
 """
 
 from fastapi import APIRouter, Depends, Header
@@ -52,8 +57,9 @@ settings = get_settings()
 
 def _build_conversational_system_prompt() -> str:
     """
-    Build a system prompt for conversational (non-DB) responses that keeps
-    the assistant in character for this specific client deployment.
+    System prompt for conversational (non-DB) responses.
+    Reads ClientConfig so the assistant stays in character for this deployment.
+    Falls back to a safe generic string if config is unavailable.
     """
     try:
         cfg = get_client_config()
@@ -63,9 +69,7 @@ def _build_conversational_system_prompt() -> str:
             f"You help users query and understand their business data. "
             f"Your tone is {cfg.tone}. "
             f"Keep responses concise and friendly. "
-            f"Do not make up data or answer questions outside your scope. "
-            f"If asked what you can do or your services, list the some example queries and what kind of insights you can fetch from {cfg.db_context_structured}."
-            f"relevant to {cfg.company_name}."
+            f"Do not make up data or answer questions outside your scope."
         )
     except Exception:
         return "You are a helpful data analytics assistant. Respond concisely."
@@ -74,10 +78,6 @@ def _build_conversational_system_prompt() -> str:
 def _build_help_answer() -> str:
     """
     Build a structured HELP response from ClientConfig without calling the LLM.
-
-    Formats comma-separated scope descriptions as bullet lists so the
-    response is readable rather than one long paragraph.
-
     Falls back to a safe generic message if ClientConfig is unavailable.
     """
     try:
@@ -129,8 +129,8 @@ def _build_help_answer() -> str:
         return (
             "I'm a data analytics assistant. I can help you query your "
             "database and answer questions about your business data. "
-            "Try asking something like \"Show me the top customers\" or "
-            "\"How many orders were placed this month?\""
+            'Try asking something like "Show me the top customers" or '
+            '"How many orders were placed this month?"'
         )
 
 
@@ -139,8 +139,8 @@ def _build_help_answer() -> str:
 def _sse(payload: dict) -> str:
     """Format a dict as a single SSE data line."""
     return f"data: {json.dumps(payload, default=str)}\n\n"
- 
- 
+
+
 @router.post("/query")
 async def run_query(
     body: QueryRequest,
@@ -150,46 +150,79 @@ async def run_query(
 ):
     question = body.question
     context = body.context or []
+    displayed_count = body.displayed_count   # ← how many rows frontend has already shown
     now = datetime.now(timezone.utc)
     page_size = settings.PAGE_SIZE
- 
+
     async def stream():
- 
+
         # ── 1. Intent classification ──────────────────────────────────────────
-        # FIX: context is now passed to classify() so pagination and follow-up
-        # patterns are evaluated against prior conversation turns.
         if settings.INTENT_CLASSIFIER_ENABLED:
             try:
                 intent = classify(
                     question=question,
                     llm=service.llm,
                     use_llm_fallback=settings.INTENT_LLM_FALLBACK,
-                    context=context,    # ← FIX: was missing before
+                    context=context,
                 )
             except Exception:
                 logger.exception("[STREAM] Intent classification failed")
                 intent = IntentType.AMBIGUOUS
         else:
             intent = IntentType.DB_QUERY
- 
+
         logger.info(
             f"[STREAM] intent={intent.value} | "
             f"context_turns={len(context)} | "
+            f"displayed_count={displayed_count} | "
             f"question={question[:80]!r}"
         )
- 
-        # ── 2. Conversational response ────────────────────────────────────────
-        if intent in {IntentType.GREETING, IntentType.CHAT, IntentType.HELP, IntentType.FAREWELL}:
-            conversational_prompt = (
-                "You are a helpful assistant. Respond conversationally and concisely.\n\n"
-                f"User: {question}"
-            )
+
+        # ── 2. HELP — no LLM call, built from ClientConfig ───────────────────
+        if intent == IntentType.HELP:
+            answer = _build_help_answer()
+
+            append_to_history({
+                "id": str(uuid.uuid4()),
+                "question": question,
+                "sql": "",
+                "strategy_used": "help",
+                "row_count": 0,
+                "answer": answer,
+                "created_at": now,
+            })
+
+            words = answer.split(" ")
+            for i, word in enumerate(words):
+                chunk = word if i == 0 else " " + word
+                yield _sse({"chunk": chunk, "done": False})
+
+            yield _sse({
+                "question": question,
+                "sql": "",
+                "results": [],
+                "all_results": [],
+                "row_count": 0,
+                "total_rows": 0,
+                "page_size": page_size,
+                "strategy_used": "help",
+                "error": None,
+                "done": True,
+            })
+            return
+
+        # ── 3. Conversational (GREETING, CHAT, FAREWELL) ──────────────────────
+        # FIX: now uses _build_conversational_system_prompt() so the assistant
+        # responds in-character for this client deployment, not as a generic bot.
+        if intent in {IntentType.GREETING, IntentType.CHAT, IntentType.FAREWELL}:
+            system_prompt = _build_conversational_system_prompt()
+            conversational_prompt = f"{system_prompt}\n\nUser: {question}"
             try:
                 answer = service.llm.generate(conversational_prompt)
             except Exception:
                 logger.exception("[STREAM] Conversational LLM call failed")
                 answer = "I'm here to help! What would you like to know?"
- 
+
             append_to_history({
                 "id": str(uuid.uuid4()),
                 "question": question,
@@ -199,12 +232,12 @@ async def run_query(
                 "answer": answer,
                 "created_at": now,
             })
- 
+
             words = answer.split(" ")
             for i, word in enumerate(words):
                 chunk = word if i == 0 else " " + word
                 yield _sse({"chunk": chunk, "done": False})
- 
+
             yield _sse({
                 "question": question,
                 "sql": "",
@@ -218,12 +251,13 @@ async def run_query(
                 "done": True,
             })
             return
- 
-        # ── 3. Ambiguous ──────────────────────────────────────────────────────
+
+        # ── 4. Ambiguous ──────────────────────────────────────────────────────
         if intent == IntentType.AMBIGUOUS:
             answer = (
                 "I'm not sure if this is a database question. "
-                "Could you rephrase it? For example: 'Show me the top 10 customers by revenue.'"
+                "Could you rephrase it? For example: "
+                "'Show me the top 10 customers by revenue.'"
             )
             append_to_history({
                 "id": str(uuid.uuid4()),
@@ -247,19 +281,20 @@ async def run_query(
                 "done": True,
             })
             return
- 
-        # ── 4. DB Query OR Pagination — both go through service.run() ─────────
-        # PAGINATION uses service.run() with intent=PAGINATION so query_service
-        # can use the previous question for schema retrieval and the dedicated
-        # pagination prompt. This is the core fix for the hallucination bug.
+
+        # ── 5. DB Query or Pagination — both go through service.run() ─────────
+        # For PAGINATION, displayed_count is the reliable source of truth for
+        # the OFFSET. It comes from the frontend and is a plain integer — no
+        # regex scraping of LLM answer text needed.
         yield _sse({"status": "thinking", "done": False})
- 
+
         result = service.run(
             question,
             context=context,
-            intent=intent,          # ← FIX: intent is now passed through
+            intent=intent,
+            displayed_count=displayed_count,   # ← passed straight to prompt_builder
         )
- 
+
         if result.error:
             logger.error(f"[STREAM] Pipeline error: {result.error}")
             yield _sse({
@@ -275,20 +310,20 @@ async def run_query(
                 "done": True,
             })
             return
- 
+
         all_results = result.results
         total_rows = result.row_count
         first_page = all_results[:page_size]
- 
+
         logger.info(
             f"[STREAM] Response ready | "
             f"total_rows={total_rows} | "
             f"first_page={len(first_page)} | "
             f"strategy={result.strategy_used} | "
-            f"is_pagination={intent == IntentType.PAGINATION}"
+            f"intent={intent.value}"
         )
- 
-        # Persist to MongoDB
+
+        # Persist to in-memory history
         append_to_history({
             "id": str(uuid.uuid4()),
             "question": result.question,
@@ -298,7 +333,8 @@ async def run_query(
             "answer": result.answer,
             "created_at": now,
         })
- 
+
+        # Persist to MongoDB (chat messages)
         if x_chat_id and x_user_id:
             try:
                 db = get_data_db()
@@ -330,13 +366,13 @@ async def run_query(
                 )
             except Exception as e:
                 logger.warning(f"[STREAM] Failed to persist messages: {e}")
- 
+
         # Stream answer word by word
         words = result.answer.split(" ")
         for i, word in enumerate(words):
             chunk = word if i == 0 else " " + word
             yield _sse({"chunk": chunk, "done": False})
- 
+
         # Final done event with all data
         yield _sse({
             "question": result.question,
@@ -350,7 +386,7 @@ async def run_query(
             "error": None,
             "done": True,
         })
- 
+
     return StreamingResponse(
         stream(),
         media_type="text/event-stream",

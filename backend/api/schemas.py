@@ -7,16 +7,17 @@ class QueryRequest(BaseModel):
     question: str
     db_type: str | None = None
     context: list[dict] | None = []
+    displayed_count: int = 0          # ← rows already shown to user; drives OFFSET for pagination
 
 
 class QueryResponse(BaseModel):
     question: str
     sql: str
     results: list[dict]
-    all_results: list[dict] = []      # ← ADD: all rows for pagination
+    all_results: list[dict] = []
     row_count: int
-    total_rows: int = 0               # ← ADD: total rows fetched
-    page_size: int = 10               # ← ADD: page size setting
+    total_rows: int = 0
+    page_size: int = 10
     strategy_used: str
     answer: str
     error: str | None = None
@@ -38,6 +39,7 @@ class HealthResponse(BaseModel):
     db_connected: bool
     llm_provider: str
     strategy: str
+
 
 class MessageRecord(BaseModel):
     id: str
