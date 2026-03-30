@@ -1,0 +1,50 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# client-configs/classicmodels/client.yaml
+#
+# Top-level metadata for the ClassicModels client deployment.
+# This file is the identity card of the client.
+# Loaded at startup by core/client_config.py.
+#
+# TO ONBOARD A NEW CLIENT:
+#   1. Copy this entire folder to client-configs/<new_client_name>/
+#   2. Edit every file in the folder — this yaml, both prompts, db_context.md
+#   3. Set CLIENT_CONFIG_PATH=./client-configs/<new_client_name> in .env
+#   4. Restart. Zero code changes.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Identity ──────────────────────────────────────────────────────────────────
+assistant_name: "ClassicModels Analytics Assistant"
+company_name: "Classic Models"
+company_short: "ClassicModels"             # used in short contexts (logs, badges)
+db_name: "classicmodels"                   # actual MySQL database name
+db_type: "mysql"                           # mysql | mongo (must match DB_TYPE in .env)
+
+# ── Tone & style ──────────────────────────────────────────────────────────────
+# Used by the answer system prompt to calibrate response style.
+# Options: professional | friendly | technical | concise
+tone: "professional"
+
+# ── Business description ───────────────────────────────────────────────────────
+# One paragraph. Injected into both system prompts.
+# Write it as if briefing a new analyst on day 1.
+business_description: >
+  Classic Models is a B2B wholesale distributor of die-cast scale model vehicles —
+  classic cars, motorcycles, planes, ships, trains, trucks, and vintage cars.
+  Customers are businesses (not individuals). Revenue is generated through
+  wholesale orders fulfilled by a global salesforce operating out of 7 offices
+  across 4 territories: NA, EMEA, APAC, and Japan.
+
+# ── Currency and locale ───────────────────────────────────────────────────────
+currency_symbol: "$"
+currency_code: "USD"
+date_format: "MMM D, YYYY"                 # e.g. Jan 6, 2003
+number_format: "comma_separated"           # e.g. 2,996 units
+
+# ── Scope guardrails ──────────────────────────────────────────────────────────
+# What the assistant can and cannot answer — used in out-of-scope handling.
+in_scope_description: >
+  Customer orders, product catalogue, sales rep performance, payment records,
+  office and territory data, inventory levels, revenue and profit analysis.
+out_of_scope_description: >
+  HR data beyond org structure, external market data, competitor information,
+  raw payment credentials (card numbers, CVV, UPI IDs, account numbers).

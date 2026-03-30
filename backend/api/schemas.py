@@ -13,7 +13,10 @@ class QueryResponse(BaseModel):
     question: str
     sql: str
     results: list[dict]
+    all_results: list[dict] = []      # ← ADD: all rows for pagination
     row_count: int
+    total_rows: int = 0               # ← ADD: total rows fetched
+    page_size: int = 10               # ← ADD: page size setting
     strategy_used: str
     answer: str
     error: str | None = None

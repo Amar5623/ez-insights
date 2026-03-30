@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef } from 'react'
 import { useChat } from '@/lib/chat-context'
 import type { ChatMessage } from '@/lib/types'
 import { cn } from '@/lib/utils'
@@ -16,60 +16,72 @@ import {
   UserIcon,
   BotIcon,
   CodeIcon,
-  TableIcon,
   ChevronDownIcon,
   SparklesIcon,
   ZapIcon,
-  ChevronDownIcon as ChevronIcon,
 } from 'lucide-react'
 
-// ── Constants ──────────────────────────────────────────────────────────────────
-const PAGE_SIZE = 10
+// ── Markdown renderer ──────────────────────────────────────────────────────────
+// Parses the LLM answer into segments: markdown tables → <table>, rest → <p>
+// No external library needed.
 
-// ── ResultTable ────────────────────────────────────────────────────────────────
-// Replaces the old static slice(0,10) + "Showing X of Y" text.
-// Keeps all fetched rows in memory — no re-fetch on "Show more".
-function ResultTable({
-  results,
-  rowCount,
-}: {
-  results: Record<string, unknown>[]
-  rowCount: number
-}) {
-  const [visibleCount, setVisibleCount] = useState(PAGE_SIZE)
+function parseMarkdownTable(
+  block: string,
+): { headers: string[]; rows: string[][] } | null {
+  const lines = block.trim().split('\n').filter(l => l.trim())
+  if (lines.length < 2) return null
+  const isSeparator = (l: string) => /^\|?[\s\-|:]+\|?$/.test(l.trim())
+  if (!isSeparator(lines[1])) return null
 
-  const displayed  = results.slice(0, visibleCount)
-  const remaining  = results.length - visibleCount
-  const columns    = Object.keys(results[0])
+  const parseRow = (l: string) =>
+    l
+      .trim()
+      .replace(/^\||\|$/g, '')
+      .split('|')
+      .map(c => c.trim())
+
+  const headers = parseRow(lines[0])
+  const rows = lines.slice(2).map(parseRow)
+  return { headers, rows }
+}
+
+function MarkdownTable({ block }: { block: string }) {
+  const parsed = parseMarkdownTable(block)
+  if (!parsed)
+    return (
+      <p className="text-sm leading-relaxed whitespace-pre-wrap">{block}</p>
+    )
+
+  const { headers, rows } = parsed
 
   return (
-    <div className="overflow-hidden rounded-xl border border-border shadow-sm">
+    <div className="my-2 overflow-hidden rounded-xl border border-border shadow-sm">
       <div className="overflow-x-auto">
         <table className="w-full text-xs">
           <thead>
             <tr className="border-b border-border bg-muted/70">
-              {columns.map((col) => (
+              {headers.map((h, i) => (
                 <th
-                  key={col}
+                  key={i}
                   className="whitespace-nowrap px-4 py-3 text-left font-semibold text-foreground"
                 >
-                  {col}
+                  {h}
                 </th>
               ))}
             </tr>
           </thead>
           <tbody>
-            {displayed.map((row, i) => (
+            {rows.map((row, i) => (
               <tr
                 key={i}
                 className="border-b border-border/50 last:border-0 transition-colors hover:bg-muted/30"
               >
-                {Object.values(row).map((val, j) => (
+                {row.map((cell, j) => (
                   <td
                     key={j}
                     className="whitespace-nowrap px-4 py-2.5 text-muted-foreground"
                   >
-                    {String(val ?? '')}
+                    {cell}
                   </td>
                 ))}
               </tr>
@@ -77,23 +89,49 @@ function ResultTable({
           </tbody>
         </table>
       </div>
+    </div>
+  )
+}
 
-      {/* Footer: row count summary + Show more button */}
-      <div className="flex items-center justify-between border-t border-border bg-muted/30 px-4 py-2">
-        <span className="text-xs text-muted-foreground">
-          Showing {Math.min(visibleCount, results.length)} of {rowCount} rows
-        </span>
+// Splits answer text into table blocks and text blocks, renders each correctly
+function MarkdownAnswer({ content }: { content: string }) {
+  const segments = content.split(/((?:^\|.+\n?)+)/m)
 
-        {remaining > 0 && (
-          <button
-            onClick={() => setVisibleCount((v) => v + PAGE_SIZE)}
-            className="flex items-center gap-1 rounded-md px-2 py-1 text-xs text-primary transition-colors hover:bg-primary/10"
-          >
-            <ChevronIcon className="h-3 w-3" />
-            Show {Math.min(PAGE_SIZE, remaining)} more
-          </button>
-        )}
-      </div>
+  return (
+    <div className="space-y-1">
+      {segments.map((segment, i) => {
+        if (!segment.trim()) return null
+        const lines = segment.trim().split('\n')
+        const looksLikeTable =
+          lines.length >= 2 && lines[0].trim().startsWith('|')
+
+        if (looksLikeTable) {
+          return <MarkdownTable key={i} block={segment} />
+        }
+
+        return (
+          <div key={i} className="text-sm leading-relaxed">
+            {segment.split('\n').map((line, j) => {
+              if (!line.trim()) return <br key={j} />
+
+              const parts = line.split(/(\*\*[^*]+\*\*)/g)
+              return (
+                <p key={j} className="my-0.5">
+                  {parts.map((part, k) =>
+                    part.startsWith('**') && part.endsWith('**') ? (
+                      <strong key={k} className="font-semibold text-foreground">
+                        {part.slice(2, -2)}
+                      </strong>
+                    ) : (
+                      part
+                    ),
+                  )}
+                </p>
+              )
+            })}
+          </div>
+        )
+      })}
     </div>
   )
 }
@@ -119,19 +157,23 @@ function LoadingBubble() {
 }
 
 // ── MessageBubble ──────────────────────────────────────────────────────────────
-function MessageBubble({ message, index }: { message: ChatMessage; index: number }) {
+function MessageBubble({
+  message,
+  index,
+}: {
+  message: ChatMessage
+  index: number
+}) {
   const isUser = message.role === 'user'
 
-  if (message.isLoading) {
+  // Show loading bubble only when isLoading AND no content yet
+  if (message.isLoading && !message.content) {
     return <LoadingBubble />
   }
 
   return (
     <div
-      className={cn(
-        'flex gap-3 animate-fade-in-up',
-        isUser && 'flex-row-reverse'
-      )}
+      className={cn('flex gap-3 animate-fade-in-up', isUser && 'flex-row-reverse')}
       style={{ animationDelay: `${index * 50}ms` }}
     >
       <div
@@ -139,7 +181,7 @@ function MessageBubble({ message, index }: { message: ChatMessage; index: number
           'flex h-9 w-9 shrink-0 items-center justify-center rounded-xl transition-transform duration-300 hover:scale-105',
           isUser
             ? 'bg-primary shadow-md shadow-primary/25'
-            : 'bg-gradient-to-br from-primary/20 to-primary/10 ring-2 ring-primary/20'
+            : 'bg-gradient-to-br from-primary/20 to-primary/10 ring-2 ring-primary/20',
         )}
       >
         {isUser ? (
@@ -152,7 +194,7 @@ function MessageBubble({ message, index }: { message: ChatMessage; index: number
       <div
         className={cn(
           'flex max-w-[80%] flex-col gap-2',
-          isUser && 'items-end'
+          isUser && 'items-end',
         )}
       >
         <div
@@ -160,15 +202,19 @@ function MessageBubble({ message, index }: { message: ChatMessage; index: number
             'rounded-2xl px-4 py-3 shadow-sm transition-all duration-300',
             isUser
               ? 'bg-primary text-primary-foreground shadow-primary/20'
-              : 'bg-card border border-border text-foreground'
+              : 'bg-card border border-border text-foreground',
           )}
         >
-          <p className="whitespace-pre-wrap text-sm leading-relaxed">
-            {message.content}
-          </p>
+          {isUser ? (
+            <p className="whitespace-pre-wrap text-sm leading-relaxed">
+              {message.content}
+            </p>
+          ) : (
+            <MarkdownAnswer content={message.content} />
+          )}
         </div>
 
-        {/* SQL Preview — unchanged */}
+        {/* SQL Preview */}
         {message.sql && (
           <Collapsible className="w-full animate-scale-in">
             <CollapsibleTrigger className="flex items-center gap-2 rounded-lg px-3 py-1.5 text-xs text-muted-foreground transition-all duration-200 hover:bg-muted hover:text-foreground">
@@ -184,24 +230,7 @@ function MessageBubble({ message, index }: { message: ChatMessage; index: number
           </Collapsible>
         )}
 
-        {/* Results Table — now uses ResultTable with pagination */}
-        {message.results && message.results.length > 0 && (
-          <Collapsible className="w-full animate-scale-in animation-delay-100">
-            <CollapsibleTrigger className="flex items-center gap-2 rounded-lg px-3 py-1.5 text-xs text-muted-foreground transition-all duration-200 hover:bg-muted hover:text-foreground">
-              <TableIcon className="h-3.5 w-3.5" />
-              <span>View Results ({message.row_count} rows)</span>
-              <ChevronDownIcon className="h-3.5 w-3.5 transition-transform duration-200 group-data-[state=open]:rotate-180" />
-            </CollapsibleTrigger>
-            <CollapsibleContent className="mt-2 animate-fade-in">
-              <ResultTable
-                results={message.results}
-                rowCount={message.row_count ?? message.results.length}
-              />
-            </CollapsibleContent>
-          </Collapsible>
-        )}
-
-        {/* Strategy Badge — unchanged */}
+        {/* Strategy Badge */}
         {message.strategy_used && (
           <Badge
             variant="secondary"
@@ -226,11 +255,9 @@ function MessageBubble({ message, index }: { message: ChatMessage; index: number
 // ── ChatMessages ───────────────────────────────────────────────────────────────
 export function ChatMessages({ sidebarOpen }: { sidebarOpen: boolean }) {
   const { currentChat, isLoading, sendMessage } = useChat()
-  // FIX: Direct ref to the Radix ScrollArea Viewport so we can imperatively
-  // set scrollTop — avoids the scrollIntoView-on-wrong-ancestor bug.
   const viewportRef = useRef<HTMLDivElement>(null)
 
-  // Auto-scroll to bottom when new messages arrive
+  // Auto-scroll to bottom whenever messages change
   useEffect(() => {
     if (!viewportRef.current) return
     viewportRef.current.scrollTop = viewportRef.current.scrollHeight
@@ -266,8 +293,8 @@ export function ChatMessages({ sidebarOpen }: { sidebarOpen: boolean }) {
             Welcome to Ez-Insights
           </h2>
           <p className="text-muted-foreground leading-relaxed">
-            Ask questions about your database in plain English. I'll translate
-            them into SQL queries and show you the results instantly.
+            Ask questions about your database in plain English. I&apos;ll
+            translate them into SQL queries and show you the results instantly.
           </p>
           <div className="mt-8 flex flex-wrap justify-center gap-2">
             {SUGGESTION_CHIPS.map((text, i) => (
@@ -287,10 +314,9 @@ export function ChatMessages({ sidebarOpen }: { sidebarOpen: boolean }) {
     )
   }
 
-  // Has messages — logo + name stay at top, description + chips are gone
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
-      {/* Sticky header — logo + name only */}
+      {/* Compact header shown when sidebar is collapsed */}
       {!sidebarOpen && (
         <div className="flex items-center gap-3 border-b border-border px-6 py-3 bg-background/80 backdrop-blur-sm animate-fade-in">
           <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-gradient-to-br from-primary/20 to-primary/5 ring-2 ring-primary/10">
@@ -300,7 +326,6 @@ export function ChatMessages({ sidebarOpen }: { sidebarOpen: boolean }) {
         </div>
       )}
 
-      {/* Messages */}
       <ScrollAreaPrimitive.Root className="flex-1 overflow-hidden theme-transition">
         <ScrollAreaPrimitive.Viewport ref={viewportRef} className="h-full w-full">
           <div className="mx-auto max-w-3xl space-y-6 p-6 pb-8">
@@ -309,7 +334,10 @@ export function ChatMessages({ sidebarOpen }: { sidebarOpen: boolean }) {
             ))}
           </div>
         </ScrollAreaPrimitive.Viewport>
-        <ScrollAreaPrimitive.Scrollbar orientation="vertical" className="flex touch-none select-none transition-colors h-full w-2.5 border-l border-l-transparent p-[1px]">
+        <ScrollAreaPrimitive.Scrollbar
+          orientation="vertical"
+          className="flex touch-none select-none transition-colors h-full w-2.5 border-l border-l-transparent p-px"
+        >
           <ScrollAreaPrimitive.Thumb className="relative flex-1 rounded-full bg-border" />
         </ScrollAreaPrimitive.Scrollbar>
       </ScrollAreaPrimitive.Root>

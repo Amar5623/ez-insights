@@ -17,10 +17,12 @@ from services.query_service import QueryService
 from api.routes import query, history, health, chats
 from api.middleware.auth import AuthMiddleware
 from api.middleware.logging import LoggingMiddleware
+from core.logging_config import setup_logging, get_logger
+from core.client_config import get_client_config
 
 # Global service instance — created once at startup
 _query_service: QueryService | None = None
-
+logger = get_logger(__name__)
 
 def get_query_service() -> QueryService:
     if _query_service is None:
@@ -31,7 +33,13 @@ def get_query_service() -> QueryService:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: wire all factories and index schema."""
+    
+    setup_logging()
+    logger = get_logger(__name__)
     global _query_service
+
+    cfg = get_client_config()   # validates client config at startup, not on first request
+    logger.info(f"[startup] Client='{cfg.company_name}' | DB='{cfg.db_name}'")
 
     s = get_settings()
 

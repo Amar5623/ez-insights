@@ -1,111 +1,160 @@
-import type { QueryRequest, QueryResponse, HistoryItem, HealthResponse } from './types'
+/**
+ * lib/api.ts
+ *
+ * All fetch calls in one place, typed.
+ *
+ * TOKEN STRATEGY
+ * ──────────────
+ * page.tsx calls setJwtToken(token) in a useEffect whenever auth state changes.
+ * BUT: ChatProvider's useEffect that calls loadChats fires in the SAME render
+ * cycle — before setJwtToken has run. So we fall back to reading the token
+ * directly from localStorage. By the time `user` is truthy in auth-context,
+ * the token is guaranteed to already be in localStorage (set during login/signup
+ * and confirmed by the /api/auth/me check). This eliminates the "Not
+ * authenticated" 401 on the very first fetchChats call.
+ */
 
-const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
-const API_KEY = process.env.NEXT_PUBLIC_API_KEY || ''
+// ── Module-level state ─────────────────────────────────────────────────────────
 
-// JWT token — set by page.tsx on auth change
+const TOKEN_KEY = 'ez_insights_token'
+
 let _jwtToken: string | null = null
-export function setJwtToken(token: string | null) {
+let _activeChatId: string | null = null
+let _activeUserId: string | null = null
+
+/** Called by page.tsx whenever auth token changes. */
+export function setJwtToken(token: string | null): void {
   _jwtToken = token
 }
 
-// Active chat context — set by chat-context.tsx on chat change
-let _activeChatId: string | null = null
-let _activeUserId: string | null = null
-export function setActiveChatContext(chatId: string | null, userId: string | null) {
+/** Called by chat-context whenever active chat / user changes. */
+export function setActiveChatContext(chatId: string | null, userId: string | null): void {
   _activeChatId = chatId
   _activeUserId = userId
 }
 
-// ── Core fetch wrapper ────────────────────────────────────────────────────────
-
-async function fetchWithAuth(endpoint: string, options: RequestInit = {}) {
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    'X-API-Key': API_KEY,
-    ...(options.headers as Record<string, string>),
+/**
+ * Returns the JWT — prefers the in-memory value set by setJwtToken(),
+ * falls back to localStorage so the very first API call on mount works even
+ * before page.tsx's useEffect has fired.
+ */
+function getToken(): string | null {
+  if (_jwtToken) return _jwtToken
+  if (typeof window !== 'undefined') {
+    const stored = localStorage.getItem(TOKEN_KEY)
+    if (stored && stored !== 'undefined') return stored
   }
-
-  if (_jwtToken) {
-    headers['Authorization'] = `Bearer ${_jwtToken}`
-  }
-
-  const response = await fetch(`${API_URL}${endpoint}`, {
-    ...options,
-    headers,
-  })
-
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ detail: 'Request failed' }))
-    throw new Error(error.detail || `HTTP ${response.status}`)
-  }
-
-  return response.json()
+  return null
 }
 
-// ── Query API ─────────────────────────────────────────────────────────────────
+// ── Remote types (matching backend Pydantic models) ────────────────────────────
 
-export async function sendQuery(request: QueryRequest): Promise<QueryResponse> {
-  const headers: Record<string, string> = {}
-
-  // Pass active chat context so backend can auto-persist messages
-  if (_activeChatId) headers['X-Chat-Id'] = _activeChatId
-  if (_activeUserId) headers['X-User-Id'] = _activeUserId
-
-  return fetchWithAuth('/api/query', {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(request),
-  })
-}
-
-// ── History API (legacy) ──────────────────────────────────────────────────────
-
-export async function getHistory(limit: number = 20): Promise<HistoryItem[]> {
-  return fetchWithAuth(`/api/history?limit=${limit}`)
-}
-
-export async function deleteHistoryItem(id: string): Promise<{ deleted: boolean }> {
-  return fetchWithAuth(`/api/history/${id}`, { method: 'DELETE' })
-}
-
-// ── Health API ────────────────────────────────────────────────────────────────
-
-export async function checkHealth(): Promise<HealthResponse> {
-  return fetchWithAuth('/api/health')
-}
-
-// ── Chat API ──────────────────────────────────────────────────────────────────
-
-export interface ChatRecordAPI {
+export interface RemoteChat {
   id: string
-  user_id: string
   title: string
+  user_id: string
   created_at: string
   updated_at: string
 }
 
-export interface MessageRecordAPI {
+export interface RemoteMessage {
   id: string
   chat_id: string
+  user_id: string
   role: 'user' | 'assistant'
   question: string
-  sql: string | null
-  answer: string | null
-  strategy_used: string | null
-  row_count: number | null
+  answer?: string
+  sql?: string
+  row_count?: number
+  strategy_used?: string
   created_at: string
 }
 
-export async function fetchChats(userId: string): Promise<ChatRecordAPI[]> {
-  return fetchWithAuth(`/api/chats?user_id=${encodeURIComponent(userId)}`)
+export interface QueryResponse {
+  question: string
+  sql: string
+  results: Record<string, unknown>[]
+  all_results: Record<string, unknown>[]
+  row_count: number
+  total_rows: number
+  page_size: number
+  strategy_used: string
+  answer: string
+  error: string | null
+  done: boolean
+  chunk?: string
+  status?: string
 }
 
-export async function createChat(userId: string, title: string = 'New Chat'): Promise<ChatRecordAPI> {
-  return fetchWithAuth('/api/chats', {
+// ── Generic authenticated proxy fetch ─────────────────────────────────────────
+
+/**
+ * Wraps fetch() for all /api/proxy/* calls:
+ *  - Injects Authorization: Bearer <token>
+ *  - Translates 401 → "Not authenticated"
+ *  - Translates 502 / network failure → "Backend unreachable"
+ */
+export async function proxyFetch(path: string, options: RequestInit = {}): Promise<Response> {
+  const token = getToken()
+  if (!token) throw new Error('Not authenticated')
+
+  const existingHeaders = (options.headers as Record<string, string>) ?? {}
+  const headers: Record<string, string> = {
+    ...existingHeaders,
+    Authorization: `Bearer ${token}`,
+  }
+
+  let res: Response
+  try {
+    res = await fetch(path, { ...options, headers })
+  } catch (err) {
+    throw new Error('Backend unreachable')
+  }
+
+  if (res.status === 401) throw new Error('Not authenticated')
+  if (res.status === 502) throw new Error('Backend unreachable')
+  if (!res.ok) {
+    const text = await res.text().catch(() => `HTTP ${res.status}`)
+    let detail = text
+    try {
+      detail = JSON.parse(text)?.detail ?? text
+    } catch {
+      // keep raw text
+    }
+    throw new Error(detail)
+  }
+
+  return res
+}
+
+// ── Chat CRUD ─────────────────────────────────────────────────────────────────
+
+export async function fetchChats(userId: string): Promise<RemoteChat[]> {
+  const res = await proxyFetch(`/api/proxy/chats?user_id=${encodeURIComponent(userId)}`)
+  return res.json()
+}
+
+export async function createChat(userId: string, title: string): Promise<RemoteChat> {
+  const res = await proxyFetch('/api/proxy/chats', {
     method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ user_id: userId, title }),
   })
+  return res.json()
+}
+
+export async function deleteChatAPI(chatId: string, userId: string): Promise<void> {
+  await proxyFetch(
+    `/api/proxy/chats/${encodeURIComponent(chatId)}?user_id=${encodeURIComponent(userId)}`,
+    { method: 'DELETE' },
+  )
+}
+
+export async function fetchMessages(chatId: string, userId: string): Promise<RemoteMessage[]> {
+  const res = await proxyFetch(
+    `/api/proxy/chats/${encodeURIComponent(chatId)}/messages?user_id=${encodeURIComponent(userId)}`,
+  )
+  return res.json()
 }
 
 export async function updateChatTitle(
@@ -113,21 +162,101 @@ export async function updateChatTitle(
   userId: string,
   title: string,
 ): Promise<void> {
-  await fetchWithAuth(
-    `/api/chats/${chatId}/title?user_id=${encodeURIComponent(userId)}&title=${encodeURIComponent(title)}`,
+  await proxyFetch(
+    `/api/proxy/chats/${encodeURIComponent(chatId)}/title?user_id=${encodeURIComponent(userId)}&title=${encodeURIComponent(title)}`,
     { method: 'PATCH' },
   )
 }
 
-export async function deleteChatAPI(chatId: string, userId: string): Promise<void> {
-  await fetchWithAuth(
-    `/api/chats/${chatId}?user_id=${encodeURIComponent(userId)}`,
-    { method: 'DELETE' },
-  )
-}
+// ── SSE streaming query ────────────────────────────────────────────────────────
 
-export async function fetchMessages(chatId: string, userId: string): Promise<MessageRecordAPI[]> {
-  return fetchWithAuth(
-    `/api/chats/${chatId}/messages?user_id=${encodeURIComponent(userId)}`,
-  )
+/**
+ * Streams a NL→SQL query via the backend SSE endpoint.
+ *
+ * @param body     - { question, context? }
+ * @param onChunk  - called for each word chunk as the answer streams in
+ * @param onDone   - called once with the final metadata payload (done: true)
+ * @param onError  - called if the stream yields an error event or throws
+ */
+export async function sendQuery(
+  body: {
+    question: string
+    context?: Array<{ question: string; sql: string; answer: string }>
+  },
+  onChunk: (chunk: string) => void,
+  onDone: (meta: Partial<QueryResponse>) => void,
+  onError: (err: string) => void,
+): Promise<void> {
+  const token = getToken()
+
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+  }
+  if (token) headers['Authorization'] = `Bearer ${token}`
+  // Forward active chat context so the backend can persist messages
+  if (_activeChatId) headers['X-Chat-Id'] = _activeChatId
+  if (_activeUserId) headers['X-User-Id'] = _activeUserId
+
+  let res: Response
+  try {
+    res = await fetch('/api/proxy/query', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+    })
+  } catch {
+    onError('Network error: could not reach the server.')
+    return
+  }
+
+  if (!res.ok || !res.body) {
+    const text = await res.text().catch(() => `HTTP ${res.status}`)
+    onError(text)
+    return
+  }
+
+  // ── Parse the SSE stream ─────────────────────────────────────────────────
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+
+      // SSE lines are separated by \n\n; process complete messages only
+      const parts = buffer.split('\n\n')
+      buffer = parts.pop() ?? ''
+
+      for (const part of parts) {
+        for (const line of part.split('\n')) {
+          if (!line.startsWith('data: ')) continue
+          const json = line.slice(6).trim()
+          if (!json) continue
+
+          let event: Record<string, unknown>
+          try {
+            event = JSON.parse(json)
+          } catch {
+            continue
+          }
+
+          if (event.done === true) {
+            onDone(event as Partial<QueryResponse>)
+          } else if (typeof event.chunk === 'string') {
+            onChunk(event.chunk)
+          } else if (event.error && typeof event.error === 'string') {
+            onError(event.error)
+          }
+          // status: "thinking" events are intentionally ignored here —
+          // chat-context already shows the loading bubble while isSending=true
+        }
+      }
+    }
+  } finally {
+    reader.releaseLock()
+  }
 }
