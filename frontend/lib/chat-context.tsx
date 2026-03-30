@@ -1,5 +1,32 @@
 'use client'
 
+/**
+ * lib/chat-context.tsx
+ *
+ * Central state for all chat operations.
+ *
+ * PAGINATION CHANGES
+ * ──────────────────
+ * The backend returns three extra fields on every SSE "done" event:
+ *   - total_rows : true total in the DB for this query
+ *   - page_size  : backend page size (from settings.PAGE_SIZE)
+ *
+ * chat-context stores total_rows on each assistant ChatMessage so it can be
+ * sent back to the backend on every subsequent pagination request.
+ *
+ * FIX Bug 1 — accurate footer:
+ *   When the user says "show more", we read the previous assistant message's
+ *   total_rows and include it in the sendQuery body as `total_rows`. The backend
+ *   uses it in the answer prompt so the footer always says "X of 28" instead of
+ *   "X of 10" (the batch count).
+ *
+ * FIX Bug 2 — show all remaining:
+ *   When the user's message matches a "show all" phrase, we set show_all=true
+ *   in the sendQuery body. The backend removes the PAGE_SIZE cap and returns all
+ *   remaining rows at once. The displayed_count is still sent so the SQL gets the
+ *   right OFFSET (rows 11–28, not rows 1–28 again).
+ */
+
 import {
   createContext,
   useContext,
@@ -9,385 +36,439 @@ import {
   useRef,
   type ReactNode,
 } from 'react'
-import type { Chat, ChatMessage, QueryResponse } from './types'
+import type { Chat, ChatMessage } from './types'
 import {
   sendQuery,
   fetchChats,
-  createChat,
+  createChat as createChatAPI,
   deleteChatAPI,
   fetchMessages,
-  updateChatTitle,
   setActiveChatContext,
+  type QueryResponse,
 } from './api'
 import { useAuth } from './auth-context'
 
-// ── Context type ──────────────────────────────────────────────────────────────
+// ── Context shape ──────────────────────────────────────────────────────────────
 
 interface ChatContextType {
   chats: Chat[]
   currentChat: Chat | null
   isLoading: boolean
   isSending: boolean
-  createNewChat: () => Promise<Chat | undefined>
-  selectChat: (chatId: string) => Promise<void>
-  deleteChat: (chatId: string) => Promise<void>
-  sendMessage: (content: string) => Promise<void>
+  sendMessage: (text: string) => void
+  createNewChat: () => void
+  selectChat: (id: string) => void
+  deleteChat: (id: string) => void
 }
 
 const ChatContext = createContext<ChatContextType | null>(null)
 
-const CONTEXT_WINDOW_SIZE = 15
+// ── Helpers ────────────────────────────────────────────────────────────────────
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+function makeId(): string {
+  return Math.random().toString(36).slice(2, 11)
+}
 
-function buildContextWindow(
+/** Build the context array the backend expects from prior assistant messages. */
+function buildContext(
   messages: ChatMessage[],
 ): Array<{ question: string; sql: string; answer: string }> {
-  const completed = messages.filter(m => !m.isLoading)
-  const turns: Array<{ question: string; sql: string; answer: string }> = []
-
-  for (let i = completed.length - 1; i >= 1 && turns.length < CONTEXT_WINDOW_SIZE; i--) {
-    const msg = completed[i]
-    const prev = completed[i - 1]
-    if (msg.role === 'assistant' && prev.role === 'user') {
-      turns.unshift({
-        question: prev.content,
-        sql: msg.sql || '',
-        answer: msg.content,
-      })
-      i-- // skip the user message we just consumed
+  const context: Array<{ question: string; sql: string; answer: string }> = []
+  for (const msg of messages) {
+    if (msg.role === 'assistant' && msg.content && !msg.isLoading) {
+      const idx = messages.indexOf(msg)
+      const prev = messages[idx - 1]
+      if (prev?.role === 'user') {
+        context.push({
+          question: prev.content,
+          sql: msg.sql ?? '',
+          answer: msg.content,
+        })
+      }
     }
   }
-
-  return turns
+  return context.slice(-6)
 }
 
-function generateChatTitle(firstMessage: string): string {
-  return firstMessage.slice(0, 40) + (firstMessage.length > 40 ? '...' : '')
+/**
+ * FIX Bug 2: detect "show all remaining" phrasing.
+ * Keep this list in sync with SHOW_ALL_PATTERNS in backend intent_classifier.py.
+ */
+const SHOW_ALL_PHRASES = [
+  /^\s*show\s+all\s*$/i,
+  /^\s*show\s+all\s+remaining\s*$/i,
+  /^\s*show\s+all\s+results?\s*$/i,
+  /^\s*show\s+all\s+rows?\s*$/i,
+  /^\s*show\s+everything\s*$/i,
+  /^\s*show\s+the\s+rest\s*$/i,
+  /^\s*show\s+remaining\s*$/i,
+  /^\s*show\s+rest\s*$/i,
+  /^\s*load\s+all\s*$/i,
+  /^\s*load\s+all\s+remaining\s*$/i,
+  /^\s*load\s+everything\s*$/i,
+  /^\s*get\s+all\s+remaining\s*$/i,
+  /^\s*get\s+everything\s*$/i,
+  /^\s*see\s+all\s*$/i,
+  /^\s*see\s+all\s+remaining\s*$/i,
+  /^\s*see\s+everything\s*$/i,
+  /^\s*view\s+all\s*$/i,
+  /^\s*view\s+all\s+remaining\s*$/i,
+  /^\s*view\s+everything\s*$/i,
+  /^\s*give\s+me\s+all\s*$/i,
+  /^\s*give\s+me\s+all\s+remaining\s*$/i,
+  /^\s*give\s+me\s+everything\s*$/i,
+  /^\s*show\s+all\s+of\s+them\s*$/i,
+  /^\s*show\s+me\s+all\s*$/i,
+  /^\s*show\s+me\s+everything\s*$/i,
+  /^\s*show\s+me\s+the\s+rest\s*$/i,
+  /^\s*show\s+me\s+all\s+remaining\s*$/i,
+  /^\s*all\s+remaining\s*$/i,
+  /^\s*all\s+results?\s*$/i,
+  /^\s*all\s+rows?\s*$/i,
+  /^\s*everything\s*$/i,
+  /^\s*rest\s+of\s+(them|it|the\s+results?)\s*$/i,
+]
+
+/**
+ * Standard "show more" patterns (next page only, no "all" signal).
+ * Used to decide whether to pass displayed_count to the backend.
+ */
+const SHOW_MORE_PHRASES = [
+  /^\s*more\s*$/i,
+  /^\s*next\s*$/i,
+  /^\s*continue\s*$/i,
+  /^\s*show\s+more\s*$/i,
+  /^\s*load\s+more\s*$/i,
+  /^\s*next\s+page\s*$/i,
+  /^\s*show\s+next\s+page\s*$/i,
+  /^\s*more\s+results?\s*$/i,
+  /^\s*show\s+\d+\s+more\s*$/i,
+  /^\s*next\s+\d+\s*$/i,
+  /^\s*give\s+me\s+more\s*$/i,
+  /^\s*load\s+next\s*$/i,
+  /^\s*show\s+more\s+results?\s*$/i,
+  /^\s*get\s+more\s*$/i,
+  /^\s*see\s+more\s*$/i,
+  /^\s*view\s+more\s*$/i,
+]
+
+function isShowAll(text: string): boolean {
+  return SHOW_ALL_PHRASES.some(p => p.test(text.trim()))
 }
 
-// ── Provider ──────────────────────────────────────────────────────────────────
+function isShowMore(text: string): boolean {
+  return SHOW_MORE_PHRASES.some(p => p.test(text.trim()))
+}
+
+/**
+ * Walk backwards through messages to find the last assistant message that has
+ * a row_count > 0. Returns { displayedCount, totalRows } or null if not found.
+ *
+ * FIX Bug 1: We read total_rows (the true total from the original query) so
+ * we can send it back to the backend on pagination calls.
+ */
+function getPaginationState(messages: ChatMessage[]): {
+  displayedCount: number
+  totalRows: number
+} | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]
+    if (msg.role === 'assistant' && !msg.isLoading && (msg.row_count ?? 0) > 0) {
+      return {
+        displayedCount: msg.row_count ?? 0,
+        totalRows: msg.total_rows ?? 0,
+      }
+    }
+  }
+  return null
+}
+
+// ── Provider ───────────────────────────────────────────────────────────────────
 
 export function ChatProvider({ children }: { children: ReactNode }) {
   const { user } = useAuth()
+
   const [chats, setChats] = useState<Chat[]>([])
   const [currentChatId, setCurrentChatId] = useState<string | null>(null)
-  const [isLoading, setIsLoading] = useState(true)
+  const [isLoading, setIsLoading] = useState(false)
   const [isSending, setIsSending] = useState(false)
 
-  // Stable ref for chats so callbacks don't go stale
-  const chatsRef = useRef<Chat[]>(chats)
-  useEffect(() => {
-    chatsRef.current = chats
-  }, [chats])
+  const chatsRef = useRef(chats)
+  useEffect(() => { chatsRef.current = chats }, [chats])
 
   const currentChat = chats.find(c => c.id === currentChatId) ?? null
 
-  // Keep api.ts chat context in sync
-  useEffect(() => {
-    setActiveChatContext(currentChatId, user?.id ?? null)
-  }, [currentChatId, user?.id])
-
-  // ── Load messages helper ─────────────────────────────────────────────────────
-  // Returns the updated chat list so callers can chain off it without stale state.
-
-  const loadMessagesIntoChat = useCallback(
-    async (chatId: string, userId: string, chatList: Chat[]): Promise<Chat[]> => {
-      try {
-        const remote = await fetchMessages(chatId, userId)
-        const messages: ChatMessage[] = remote.map(m => ({
-          id: m.id,
-          role: m.role as 'user' | 'assistant',
-          content: m.role === 'assistant' ? (m.answer ?? '') : m.question,
-          sql: m.sql ?? undefined,
-          results: undefined,
-          row_count: m.row_count ?? undefined,
-          strategy_used: m.strategy_used ?? undefined,
-          timestamp: new Date(m.created_at),
-        }))
-
-        const updated = chatList.map(c => (c.id === chatId ? { ...c, messages } : c))
-        setChats(updated)
-        return updated
-      } catch (err) {
-        console.error('[chat] Failed to load messages:', err)
-        return chatList
-      }
-    },
-    [],
-  )
-
-  // ── Load chats on mount / user change ────────────────────────────────────────
-
+  // ── Load chats from remote on login ───────────────────────────────────────
   useEffect(() => {
     if (!user) {
       setChats([])
       setCurrentChatId(null)
-      setIsLoading(false)
       return
     }
 
-    let cancelled = false
+    setIsLoading(true)
+    fetchChats(user.id)
+      .then(async (remoteChats) => {
+        if (remoteChats.length === 0) {
+          setIsLoading(false)
+          return
+        }
 
-    const loadChats = async () => {
-      setIsLoading(true)
-      try {
-        const remote = await fetchChats(user.id)
-        if (cancelled) return
-
-        const restored: Chat[] = remote.map(c => ({
-          id: c.id,
-          title: c.title,
+        const localChats: Chat[] = remoteChats.map(rc => ({
+          id: rc.id,
+          title: rc.title,
           messages: [],
-          created_at: new Date(c.created_at),
-          updated_at: new Date(c.updated_at),
+          created_at: rc.created_at,
+          updated_at: rc.updated_at,
         }))
+        setChats(localChats)
 
-        setChats(restored)
+        const latest = remoteChats[0]
+        setCurrentChatId(latest.id)
+        setActiveChatContext(latest.id, user.id)
 
-        if (restored.length > 0) {
-          const withMessages = await loadMessagesIntoChat(restored[0].id, user.id, restored)
-          if (cancelled) return
-          setChats(withMessages)
-          setCurrentChatId(restored[0].id)
+        try {
+          const msgs = await fetchMessages(latest.id, user.id)
+          const local: ChatMessage[] = msgs.map(m => ({
+            id: m.id,
+            role: m.role,
+            content: m.role === 'user' ? m.question : (m.answer ?? ''),
+            sql: m.sql,
+            strategy_used: m.strategy_used,
+            row_count: m.row_count,
+            timestamp: new Date(m.created_at),
+          }))
+          setChats(prev =>
+            prev.map(c => (c.id === latest.id ? { ...c, messages: local } : c)),
+          )
+        } catch {
+          // Non-fatal
         }
-      } catch (err) {
-        if (!cancelled) {
-          console.error('[chat] Failed to load chats:', err)
-        }
-      } finally {
-        if (!cancelled) setIsLoading(false)
-      }
-    }
+      })
+      .catch(() => {
+        // Network error — start with empty chats
+      })
+      .finally(() => setIsLoading(false))
+  }, [user])
 
-    loadChats()
+  // ── Create new chat ────────────────────────────────────────────────────────
+  const createNewChat = useCallback(async () => {
+    if (!user) return
 
-    return () => {
-      cancelled = true
-    }
-  }, [user, loadMessagesIntoChat])
-
-  // ── Actions ──────────────────────────────────────────────────────────────────
-
-  const createNewChat = useCallback(async (): Promise<Chat | undefined> => {
-    if (!user) return undefined
     try {
-      const remote = await createChat(user.id, 'New Chat')
+      const remote = await createChatAPI(user.id, 'New Chat')
       const newChat: Chat = {
         id: remote.id,
         title: remote.title,
         messages: [],
-        created_at: new Date(remote.created_at),
-        updated_at: new Date(remote.updated_at),
+        created_at: remote.created_at,
+        updated_at: remote.updated_at,
       }
       setChats(prev => [newChat, ...prev])
-      setCurrentChatId(newChat.id)
-      return newChat
-    } catch (err) {
-      console.error('[chat] Failed to create chat:', err)
-      return undefined
+      setCurrentChatId(remote.id)
+      setActiveChatContext(remote.id, user.id)
+    } catch {
+      const id = makeId()
+      const newChat: Chat = { id, title: 'New Chat', messages: [], created_at: new Date().toISOString(), updated_at: new Date().toISOString() }
+      setChats(prev => [newChat, ...prev])
+      setCurrentChatId(id)
+      setActiveChatContext(id, user?.id ?? null)
     }
   }, [user])
 
-  const selectChat = useCallback(
-    async (chatId: string) => {
-      if (!user) return
-      setCurrentChatId(chatId)
+  // ── Select an existing chat ────────────────────────────────────────────────
+  const selectChat = useCallback(async (id: string) => {
+    setCurrentChatId(id)
+    setActiveChatContext(id, user?.id ?? null)
 
-      const existing = chatsRef.current.find(c => c.id === chatId)
-      if (existing && existing.messages.length === 0) {
-        await loadMessagesIntoChat(chatId, user.id, chatsRef.current)
-      }
-    },
-    [user, loadMessagesIntoChat],
-  )
+    const chat = chatsRef.current.find(c => c.id === id)
+    if (!chat || chat.messages.length > 0 || !user) return
 
-  const deleteChat = useCallback(
-    async (chatId: string) => {
-      if (!user) return
-      try {
-        await deleteChatAPI(chatId, user.id)
-        setChats(prev => {
-          const next = prev.filter(c => c.id !== chatId)
-          if (currentChatId === chatId) {
-            setCurrentChatId(next.length > 0 ? next[0].id : null)
-          }
-          return next
-        })
-      } catch (err) {
-        console.error('[chat] Failed to delete chat:', err)
-      }
-    },
-    [user, currentChatId],
-  )
+    try {
+      const msgs = await fetchMessages(id, user.id)
+      const local: ChatMessage[] = msgs.map(m => ({
+        id: m.id,
+        role: m.role,
+        content: m.role === 'user' ? m.question : (m.answer ?? ''),
+        sql: m.sql,
+        strategy_used: m.strategy_used,
+        row_count: m.row_count,
+        timestamp: new Date(m.created_at),
+      }))
+      setChats(prev => prev.map(c => (c.id === id ? { ...c, messages: local } : c)))
+    } catch {
+      // Non-fatal
+    }
+  }, [user])
 
-  const sendMessage = useCallback(
-    async (content: string) => {
-      if (!user || isSending) return
+  // ── Delete a chat ──────────────────────────────────────────────────────────
+  const deleteChat = useCallback(async (id: string) => {
+    setChats(prev => prev.filter(c => c.id !== id))
+    if (currentChatId === id) {
+      const remaining = chatsRef.current.filter(c => c.id !== id)
+      const next = remaining[0] ?? null
+      setCurrentChatId(next?.id ?? null)
+      setActiveChatContext(next?.id ?? null, user?.id ?? null)
+    }
 
-      // ── Ensure a chat exists ─────────────────────────────────────────────
-      let activeChatId = currentChatId
-      if (!activeChatId) {
-        const newChat = await createNewChat()
-        if (!newChat) return
-        activeChatId = newChat.id
-      }
+    if (user) {
+      deleteChatAPI(id, user.id).catch(() => {
+        const deleted = chatsRef.current.find(c => c.id === id)
+        if (deleted) setChats(prev => [deleted, ...prev])
+      })
+    }
+  }, [currentChatId, user])
 
-      // ── Optimistically set chat title on first message ───────────────────
-      const currentChats = chatsRef.current
-      const chat = currentChats.find(c => c.id === activeChatId) ?? {
-        messages: [] as ChatMessage[],
-      }
-      const isFirstMessage = chat.messages.length === 0
-      if (isFirstMessage) {
-        const title = generateChatTitle(content)
-        setChats(prev => prev.map(c => (c.id === activeChatId ? { ...c, title } : c)))
-        updateChatTitle(activeChatId, user.id, title).catch(() => {})
-      }
-
-      // ── Add user + loading placeholder messages ──────────────────────────
-      const userMessage: ChatMessage = {
-        id: crypto.randomUUID(),
-        role: 'user',
-        content,
-        timestamp: new Date(),
-      }
-      const loadingMessageId = crypto.randomUUID()
-      const loadingMessage: ChatMessage = {
-        id: loadingMessageId,
-        role: 'assistant',
-        content: '',
-        timestamp: new Date(),
-        isLoading: true,
-      }
-
+  // ── Patch a single message in state ───────────────────────────────────────
+  const patchMessage = useCallback(
+    (chatId: string, messageId: string, patch: Partial<ChatMessage>) => {
       setChats(prev =>
         prev.map(c =>
-          c.id === activeChatId
-            ? {
+          c.id !== chatId
+            ? c
+            : {
                 ...c,
-                messages: [...c.messages, userMessage, loadingMessage],
-                updated_at: new Date(),
-              }
-            : c,
+                messages: c.messages.map(m =>
+                  m.id === messageId ? { ...m, ...patch } : m,
+                ),
+              },
         ),
       )
-
-      setIsSending(true)
-
-      try {
-        const context = buildContextWindow(chat.messages)
-        let streamedAnswer = ''
-
-        await sendQuery(
-          { question: content, context },
-
-          // onChunk — append each streamed word into the loading placeholder
-          (chunk: string) => {
-            streamedAnswer += chunk
-            setChats(prev =>
-              prev.map(c =>
-                c.id === activeChatId
-                  ? {
-                      ...c,
-                      messages: c.messages.map(m =>
-                        m.id === loadingMessageId
-                          ? { ...m, content: streamedAnswer, isLoading: false }
-                          : m,
-                      ),
-                    }
-                  : c,
-              ),
-            )
-          },
-
-          // onDone — attach sql / strategy metadata when stream ends
-          (meta: Partial<QueryResponse>) => {
-            // meta.answer is the full answer; prefer it over the streamed
-            // accumulation in case any chunk was missed
-            if (meta.answer) {
-              streamedAnswer = meta.answer
-            }
-            setChats(prev =>
-              prev.map(c =>
-                c.id === activeChatId
-                  ? {
-                      ...c,
-                      messages: c.messages.map(m =>
-                        m.id === loadingMessageId
-                          ? {
-                              ...m,
-                              content: streamedAnswer,
-                              sql: meta.sql,
-                              row_count: meta.row_count,
-                              strategy_used: meta.strategy_used,
-                              isLoading: false,
-                              timestamp: new Date(),
-                            }
-                          : m,
-                      ),
-                      updated_at: new Date(),
-                    }
-                  : c,
-              ),
-            )
-          },
-
-          // onError — replace loading placeholder with error text
-          (err: string) => {
-            setChats(prev =>
-              prev.map(c =>
-                c.id === activeChatId
-                  ? {
-                      ...c,
-                      messages: c.messages.map(m =>
-                        m.id === loadingMessageId
-                          ? {
-                              ...m,
-                              content: `⚠️ ${err}`,
-                              isLoading: false,
-                              timestamp: new Date(),
-                            }
-                          : m,
-                      ),
-                    }
-                  : c,
-              ),
-            )
-          },
-        )
-      } catch (error) {
-        // Catches network-level failures that happen before the stream starts
-        setChats(prev =>
-          prev.map(c =>
-            c.id === activeChatId
-              ? {
-                  ...c,
-                  messages: c.messages.map(m =>
-                    m.id === loadingMessageId
-                      ? {
-                          ...m,
-                          content:
-                            error instanceof Error
-                              ? `⚠️ ${error.message}`
-                              : '⚠️ An error occurred while processing your query.',
-                          isLoading: false,
-                          timestamp: new Date(),
-                        }
-                      : m,
-                  ),
-                }
-              : c,
-          ),
-        )
-      } finally {
-        setIsSending(false)
-      }
     },
-    [user, currentChatId, isSending, createNewChat],
+    [],
   )
 
-  // ── Render ────────────────────────────────────────────────────────────────
+  // ── Send a message (SSE streaming) ────────────────────────────────────────
+  const sendMessage = useCallback(
+    (text: string) => {
+      if (isSending || !text.trim()) return
+
+      const runWithChat = async (chatId: string) => {
+        const currentMessages =
+          chatsRef.current.find(c => c.id === chatId)?.messages ?? []
+
+        // 1. Add user message
+        const userMsg: ChatMessage = {
+          id: makeId(),
+          role: 'user',
+          content: text,
+          timestamp: new Date(),
+        }
+
+        // 2. Add loading assistant placeholder
+        const assistantId = makeId()
+        const assistantPlaceholder: ChatMessage = {
+          id: assistantId,
+          role: 'assistant',
+          content: '',
+          isLoading: true,
+          timestamp: new Date(),
+        }
+
+        setChats(prev =>
+          prev.map(c =>
+            c.id !== chatId
+              ? c
+              : { ...c, messages: [...c.messages, userMsg, assistantPlaceholder] },
+          ),
+        )
+
+        setIsSending(true)
+        let accumulated = ''
+
+        // ── Determine pagination parameters ────────────────────────────────
+        const showAll = isShowAll(text)
+        const showMore = isShowMore(text)
+        const isPagination = showAll || showMore
+
+        // FIX Bug 1 & Bug 2: find how many rows have been displayed and what
+        // the true total is, so we can send both to the backend.
+        const paginationState = isPagination
+          ? getPaginationState(currentMessages)
+          : null
+
+        const displayed_count = paginationState?.displayedCount ?? 0
+
+        // FIX Bug 1: send back the true total so the backend footer is accurate.
+        const total_rows = paginationState?.totalRows ?? 0
+
+        // FIX Bug 2: tell the backend to drop the PAGE_SIZE cap.
+        const show_all = showAll
+
+        await sendQuery(
+          {
+            question: text,
+            context: buildContext(currentMessages),
+            displayed_count,   // OFFSET for the next SQL page
+            total_rows,        // FIX Bug 1: true total from original query
+            show_all,          // FIX Bug 2: remove page cap
+          },
+          // onChunk — stream words into the assistant bubble
+          (chunk) => {
+            accumulated += chunk
+            patchMessage(chatId, assistantId, {
+              content: accumulated,
+              isLoading: false,
+            })
+          },
+          // onDone — store metadata including total_rows for future pagination calls
+          (meta) => {
+            patchMessage(chatId, assistantId, {
+              content: accumulated || meta.answer || '',
+              isLoading: false,
+              sql: meta.sql,
+              strategy_used: meta.strategy_used,
+              // FIX Bug 1: store the running displayed count (offset + this batch)
+              // so the next pagination call can send the right displayed_count.
+              row_count: (displayed_count) + (meta.row_count ?? 0),
+              // FIX Bug 1: store the true total so we can send it back next time.
+              total_rows: meta.total_rows ?? 0,
+            })
+
+            setIsSending(false)
+          },
+          // onError
+          (err) => {
+            patchMessage(chatId, assistantId, {
+              content: `Error: ${err}`,
+              isLoading: false,
+            })
+            setIsSending(false)
+          },
+        )
+      }
+
+      if (currentChatId) {
+        runWithChat(currentChatId)
+      } else {
+        ;(async () => {
+          if (!user) return
+          try {
+            const remote = await createChatAPI(user.id, text.slice(0, 40))
+            const newChat: Chat = {
+              id: remote.id,
+              title: remote.title,
+              messages: [],
+              created_at: remote.created_at,
+              updated_at: remote.updated_at,
+            }
+            setChats(prev => [newChat, ...prev])
+            setCurrentChatId(remote.id)
+            setActiveChatContext(remote.id, user.id)
+            runWithChat(remote.id)
+          } catch {
+            const id = makeId()
+            const newChat: Chat = { id, title: text.slice(0, 40), messages: [], created_at: new Date().toISOString(), updated_at: new Date().toISOString() }
+            setChats(prev => [newChat, ...prev])
+            setCurrentChatId(id)
+            setActiveChatContext(id, user?.id ?? null)
+            runWithChat(id)
+          }
+        })()
+      }
+    },
+    [currentChatId, isSending, patchMessage, user],
+  )
 
   return (
     <ChatContext.Provider
@@ -396,10 +477,10 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         currentChat,
         isLoading,
         isSending,
+        sendMessage,
         createNewChat,
         selectChat,
-        deleteChat,
-        sendMessage,
+        deleteChat
       }}
     >
       {children}
@@ -407,8 +488,8 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   )
 }
 
-export function useChat() {
-  const context = useContext(ChatContext)
-  if (!context) throw new Error('useChat must be used within a ChatProvider')
-  return context
+export function useChat(): ChatContextType {
+  const ctx = useContext(ChatContext)
+  if (!ctx) throw new Error('useChat must be used inside <ChatProvider>')
+  return ctx
 }

@@ -7,16 +7,19 @@ class QueryRequest(BaseModel):
     question: str
     db_type: str | None = None
     context: list[dict] | None = []
+    displayed_count: int = 0          # rows already shown to user; drives OFFSET for pagination
+    total_rows: int = 0               # FIX Bug 1: true total from the original query, sent back by frontend on pagination so the footer stays accurate
+    show_all: bool = False            # FIX Bug 2: True when user says "show all remaining" — removes PAGE_SIZE cap
 
 
 class QueryResponse(BaseModel):
     question: str
     sql: str
     results: list[dict]
-    all_results: list[dict] = []      # ← ADD: all rows for pagination
+    all_results: list[dict] = []
     row_count: int
-    total_rows: int = 0               # ← ADD: total rows fetched
-    page_size: int = 10               # ← ADD: page size setting
+    total_rows: int = 0
+    page_size: int = 10
     strategy_used: str
     answer: str
     error: str | None = None
@@ -38,6 +41,7 @@ class HealthResponse(BaseModel):
     db_connected: bool
     llm_provider: str
     strategy: str
+
 
 class MessageRecord(BaseModel):
     id: str

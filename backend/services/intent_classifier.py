@@ -1,33 +1,24 @@
 """
 services/intent_classifier.py
 
-Classifies the user's question before the pipeline runs.
+Classifies user intent before deciding whether to hit the database.
 
-INTENT TYPES (checked in this priority order):
-    PAGINATION → "show more", "next", "next page" — strict phrases only
-    GREETING   → "hi", "hello"
-    FAREWELL   → "bye", "thanks"
-    HELP       → "what can you do"
-    CHAT       → "how are you"
-    DB_QUERY   → any database question or follow-up
-    AMBIGUOUS  → classifier can't decide
+INTENT TYPES:
+    SHOW_ALL   — "show all remaining", "show everything", "show all" after a paginated
+                 result. Triggers a DB call with no PAGE_SIZE cap.
+    PAGINATION — "show more", "next page" etc. Triggers a DB call with PAGE_SIZE offset.
+    DB_QUERY   — Any other question that needs a SQL/Mongo query.
+    GREETING / CHAT / HELP / FAREWELL — Conversational, no DB call.
+    AMBIGUOUS  — Rules uncertain + no LLM available.
 
-PAGINATION is a new intent that is checked BEFORE follow-up / DB detection.
-It requires TWO conditions to both be true:
-  1. The question exactly matches a tight pagination phrase ("show more", "next")
-  2. There is prior context that contains a SQL query to paginate
-
-Without condition 2, "show more" alone is meaningless — there is nothing to
-continue. Such a message falls through to DB_QUERY.
-
-When PAGINATION is detected, query_service takes a separate code path that:
-  - Skips FAISS schema retrieval (uses the previous question's schema instead)
-  - Passes the previous SQL explicitly in the prompt
-  - Tells the LLM to add LIMIT/OFFSET to that specific SQL
+SHOW_ALL vs PAGINATION:
+    SHOW_ALL patterns are checked first and are stricter — they must contain an explicit
+    "all" signal. If matched, query.py sets show_all=True which tells prompt_builder to
+    drop the LIMIT cap and return every remaining row at once.
 """
 
-from enum import Enum
 import re
+from enum import Enum
 import time
 from typing import Optional, Protocol, runtime_checkable
 
@@ -46,7 +37,8 @@ class LLMProtocol(Protocol):
 # ─── Intent Enum ─────────────────────────────────────────────────────────────
 
 class IntentType(str, Enum):
-    PAGINATION = "PAGINATION"   # NEW: "show more", "next page"
+    SHOW_ALL   = "SHOW_ALL"    # NEW: "show all remaining", "show everything"
+    PAGINATION = "PAGINATION"  # "show more", "next page"
     GREETING   = "GREETING"
     CHAT       = "CHAT"
     HELP       = "HELP"
@@ -55,10 +47,48 @@ class IntentType(str, Enum):
     AMBIGUOUS  = "AMBIGUOUS"
 
 
+# ─── Show-all patterns ────────────────────────────────────────────────────────
+# Checked BEFORE pagination patterns.
+# Must explicitly signal "all" or "everything" or "remaining" so that plain
+# "show more" never accidentally triggers a full-table dump.
+
+SHOW_ALL_PATTERNS = [
+    r"^\s*show\s+all\s*$",
+    r"^\s*show\s+all\s+remaining\s*$",
+    r"^\s*show\s+all\s+results?\s*$",
+    r"^\s*show\s+all\s+rows?\s*$",
+    r"^\s*show\s+everything\s*$",
+    r"^\s*show\s+the\s+rest\s*$",
+    r"^\s*show\s+remaining\s*$",
+    r"^\s*show\s+rest\s*$",
+    r"^\s*load\s+all\s*$",
+    r"^\s*load\s+all\s+remaining\s*$",
+    r"^\s*load\s+everything\s*$",
+    r"^\s*get\s+all\s+remaining\s*$",
+    r"^\s*get\s+everything\s*$",
+    r"^\s*see\s+all\s*$",
+    r"^\s*see\s+all\s+remaining\s*$",
+    r"^\s*see\s+everything\s*$",
+    r"^\s*view\s+all\s*$",
+    r"^\s*view\s+all\s+remaining\s*$",
+    r"^\s*view\s+everything\s*$",
+    r"^\s*give\s+me\s+all\s*$",
+    r"^\s*give\s+me\s+all\s+remaining\s*$",
+    r"^\s*give\s+me\s+everything\s*$",
+    r"^\s*show\s+all\s+of\s+them\s*$",
+    r"^\s*show\s+me\s+all\s*$",
+    r"^\s*show\s+me\s+everything\s*$",
+    r"^\s*show\s+me\s+the\s+rest\s*$",
+    r"^\s*show\s+me\s+all\s+remaining\s*$",
+    r"^\s*all\s+remaining\s*$",
+    r"^\s*all\s+results?\s*$",
+    r"^\s*all\s+rows?\s*$",
+    r"^\s*everything\s*$",
+    r"^\s*rest\s+of\s+(them|it|the\s+results?)\s*$",
+]
+
 # ─── Pagination patterns ──────────────────────────────────────────────────────
-# Keep this list TIGHT. Only phrases that unambiguously mean
-# "give me the next batch of results from the last query."
-# Anchored with ^ and $ so "show more details about X" does NOT match.
+# Keep TIGHT. Only phrases that unambiguously mean "next batch".
 
 PAGINATION_PATTERNS = [
     r"^\s*more\s*$",
@@ -181,6 +211,17 @@ def _context_has_sql(context: list[dict]) -> bool:
     )
 
 
+def _is_show_all(question: str, context: list[dict]) -> bool:
+    """
+    True only when:
+      1. Question matches a tight show-all phrase (anchored ^ $)
+      2. Prior context has at least one turn with a SQL query to paginate
+    """
+    if not _context_has_sql(context):
+        return False
+    return _match_patterns(question.strip(), SHOW_ALL_PATTERNS)
+
+
 def _is_pagination(question: str, context: list[dict]) -> bool:
     """
     True only when:
@@ -207,18 +248,28 @@ def _rule_based_classification(
     Rule-based classification. Returns None when uncertain (needs LLM).
 
     Priority order:
-        1. PAGINATION (strictest — must match exact phrase + have prior SQL)
-        2. DB_QUERY via follow-up pattern + prior context
-        3. DB_QUERY via 2+ DB pattern matches
-        4. Conversational via 2+ conversational matches
-        5. Mixed → DB wins
-        6. None → LLM needed
+        1. SHOW_ALL   (strictest — "show all remaining", "show everything")
+        2. PAGINATION (strict — "show more", "next page")
+        3. DB_QUERY via follow-up pattern + prior context
+        4. DB_QUERY via 2+ DB pattern matches
+        5. Conversational via 2+ conversational matches
+        6. Mixed → DB wins
+        7. None → LLM needed
     """
     text = question.strip().lower()
     if not text:
         return IntentType.AMBIGUOUS
 
-    # ── 1. Pagination — checked first, strictest ──────────────────────────────
+    # ── 1. Show-all — checked first, most restrictive ─────────────────────────
+    if _is_show_all(question, context):
+        logger.debug(
+            f"[INTENT] Show-all detected | "
+            f"question={repr(question[:80])} | "
+            f"prior_sql_turns={sum(1 for t in context if t.get('sql'))}"
+        )
+        return IntentType.SHOW_ALL
+
+    # ── 2. Pagination — checked second, strict ────────────────────────────────
     if _is_pagination(question, context):
         logger.debug(
             f"[INTENT] Pagination detected | "
@@ -227,7 +278,7 @@ def _rule_based_classification(
         )
         return IntentType.PAGINATION
 
-    # ── 2. Follow-up to prior DB query ────────────────────────────────────────
+    # ── 3. Follow-up to prior DB query ────────────────────────────────────────
     if _is_followup(question, context):
         logger.debug(
             f"[INTENT] Follow-up detected | "
@@ -236,7 +287,7 @@ def _rule_based_classification(
         )
         return IntentType.DB_QUERY
 
-    # ── 3-6. Standard pattern scoring ─────────────────────────────────────────
+    # ── 4-7. Standard pattern scoring ─────────────────────────────────────────
     db_score       = _count_matches(text, DB_PATTERNS)
     greeting_score = _count_matches(text, GREETING_PATTERNS)
     farewell_score = _count_matches(text, FAREWELL_PATTERNS)

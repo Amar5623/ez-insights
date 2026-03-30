@@ -197,6 +197,14 @@ function MessageBubble({
           isUser && 'items-end',
         )}
       >
+        {/*
+         * Main bubble.
+         * The LLM streams the full formatted response as text:
+         *   1. Intro line ("Here are the top 10 orders:")
+         *   2. Markdown table (rendered by MarkdownAnswer → MarkdownTable)
+         *   3. Footer ("_Showing 10 of 47 total rows. Say **show more**..._")
+         * No separate results widget needed.
+         */}
         <div
           className={cn(
             'rounded-2xl px-4 py-3 shadow-sm transition-all duration-300',
