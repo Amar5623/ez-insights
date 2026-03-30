@@ -244,6 +244,30 @@ export async function sendQuery(
   const decoder = new TextDecoder()
   let buffer = ''
 
+  async function processSSEPart(part: string) {
+    for (const line of part.split('\n')) {
+      if (!line.startsWith('data: ')) continue
+      const json = line.slice(6).trim()
+      if (!json) continue
+
+      let event: Record<string, unknown>
+      try {
+        event = JSON.parse(json)
+      } catch {
+        continue
+      }
+
+      if (event.done === true) {
+        onDone(event as Partial<QueryResponse>)
+      } else if (typeof event.chunk === 'string') {
+        await new Promise(resolve => setTimeout(resolve, 20))
+        onChunk(event.chunk)
+      } else if (event.error && typeof event.error === 'string') {
+        onError(event.error)
+      }
+    }
+  }
+
   try {
     while (true) {
       const { done, value } = await reader.read()
@@ -255,29 +279,17 @@ export async function sendQuery(
       buffer = parts.pop() ?? ''
 
       for (const part of parts) {
-        for (const line of part.split('\n')) {
-          if (!line.startsWith('data: ')) continue
-          const json = line.slice(6).trim()
-          if (!json) continue
-
-          let event: Record<string, unknown>
-          try {
-            event = JSON.parse(json)
-          } catch {
-            continue
-          }
-
-          if (event.done === true) {
-            onDone(event as Partial<QueryResponse>)
-          } else if (typeof event.chunk === 'string') {
-            onChunk(event.chunk)
-          } else if (event.error && typeof event.error === 'string') {
-            onError(event.error)
-          }
-        }
+        processSSEPart(part)
       }
+    }
+
+    // Flush any remaining buffered data the stream closed without a trailing \n\n
+    buffer += decoder.decode()
+    if (buffer.trim()) {
+      processSSEPart(buffer)
     }
   } finally {
     reader.releaseLock()
   }
+
 }

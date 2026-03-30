@@ -408,7 +408,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
             accumulated += chunk
             patchMessage(chatId, assistantId, {
               content: accumulated,
-              isLoading: false,
+              isLoading: true,
             })
           },
           // onDone — store metadata including total_rows for future pagination calls

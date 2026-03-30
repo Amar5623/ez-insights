@@ -52,7 +52,7 @@ from core.client_config import get_client_config
 from core.db.mongo_data import get_data_db
 from core.logging_config import get_logger
 from api.schemas import QueryRequest
-
+import asyncio
 import uuid
 import json
 from datetime import datetime, timezone
@@ -190,21 +190,11 @@ async def run_query(
         if intent == IntentType.HELP:
             answer = _build_help_answer()
 
-            append_to_history({
-                "id": str(uuid.uuid4()),
-                "question": question,
-                "sql": "",
-                "strategy_used": "help",
-                "row_count": 0,
-                "answer": answer,
-                "created_at": now,
-            })
-
             words = answer.split(" ")
             for i, word in enumerate(words):
                 chunk = word if i == 0 else " " + word
                 yield _sse({"chunk": chunk, "done": False})
-
+                await asyncio.sleep(0.02)
             yield _sse({
                 "question": question,
                 "sql": "",
@@ -216,6 +206,16 @@ async def run_query(
                 "strategy_used": "help",
                 "error": None,
                 "done": True,
+            })
+
+            await asyncio.to_thread(append_to_history, {
+                "id": str(uuid.uuid4()),
+                "question": question,
+                "sql": "",
+                "strategy_used": "help",
+                "row_count": 0,
+                "answer": answer,
+                "created_at": now,
             })
             return
 
@@ -224,26 +224,16 @@ async def run_query(
             system_prompt = _build_conversational_system_prompt()
             conversational_prompt = f"{system_prompt}\n\nUser: {question}"
             try:
-                answer = service.llm.generate(conversational_prompt)
+                answer = await asyncio.to_thread(service.llm.generate, conversational_prompt)
             except Exception:
                 logger.exception("[STREAM] Conversational LLM call failed")
                 answer = "I'm here to help! What would you like to know?"
-
-            append_to_history({
-                "id": str(uuid.uuid4()),
-                "question": question,
-                "sql": "",
-                "strategy_used": "chat",
-                "row_count": 0,
-                "answer": answer,
-                "created_at": now,
-            })
 
             words = answer.split(" ")
             for i, word in enumerate(words):
                 chunk = word if i == 0 else " " + word
                 yield _sse({"chunk": chunk, "done": False})
-
+                await asyncio.sleep(0.02)
             yield _sse({
                 "question": question,
                 "sql": "",
@@ -255,6 +245,16 @@ async def run_query(
                 "strategy_used": "chat",
                 "error": None,
                 "done": True,
+            })
+
+            await asyncio.to_thread(append_to_history, {
+                "id": str(uuid.uuid4()),
+                "question": question,
+                "sql": "",
+                "strategy_used": "chat",
+                "row_count": 0,
+                "answer": answer,
+                "created_at": now,
             })
             return
 
@@ -265,15 +265,6 @@ async def run_query(
                 "Could you rephrase it? For example: "
                 "'Show me the top 10 customers by revenue.'"
             )
-            append_to_history({
-                "id": str(uuid.uuid4()),
-                "question": question,
-                "sql": "",
-                "strategy_used": "ambiguous",
-                "row_count": 0,
-                "answer": answer,
-                "created_at": now,
-            })
             yield _sse({
                 "question": question,
                 "sql": "",
@@ -286,8 +277,18 @@ async def run_query(
                 "error": None,
                 "done": True,
             })
-            return
 
+            await asyncio.to_thread(append_to_history, {
+                "id": str(uuid.uuid4()),
+                "question": question,
+                "sql": "",
+                "strategy_used": "ambiguous",
+                "row_count": 0,
+                "answer": answer,
+                "created_at": now,
+            })
+            return
+          
         # ── 5. DB Query / Pagination / Show-all — all go through service.run() ─
         # For PAGINATION, displayed_count is the reliable source of truth for
         # the OFFSET. It comes from the frontend and is a plain integer — no
@@ -303,17 +304,37 @@ async def run_query(
             else intent
         )
 
-        result = service.run(
-            question,
-            context=context,
-            intent=effective_intent,
-            displayed_count=displayed_count,
-            # FIX Bug 1: pass the true total so prompt_builder can reference it
-            # in the footer even when the DB only returned a single page's rows.
-            known_total_rows=client_total_rows,
-            # FIX Bug 2: skip PAGE_SIZE cap — return all remaining rows at once.
-            show_all=effective_show_all,
-        )
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    service.run,
+                    question,
+                    context=context,
+                    intent=effective_intent,
+                    displayed_count=displayed_count,
+                    # FIX Bug 1: pass the true total so prompt_builder can reference it
+                    # in the footer even when the DB only returned a single page's rows.
+                    known_total_rows=client_total_rows,
+                    # FIX Bug 2: skip PAGE_SIZE cap — return all remaining rows at once.
+                    show_all=effective_show_all,
+                ),
+                timeout=60.0,
+            )
+        except asyncio.TimeoutError:
+            logger.error("[STREAM] Pipeline timed out after 60s")
+            yield _sse({
+                "question": question,
+                "sql": "",
+                "results": [],
+                "all_results": [],
+                "row_count": 0,
+                "total_rows": 0,
+                "page_size": page_size,
+                "strategy_used": "timeout",
+                "error": "The query took too long to complete. Please try again or rephrase your question.",
+                "done": True,
+            })
+            return
 
         if result.error:
             logger.error(f"[STREAM] Pipeline error: {result.error}")
@@ -347,8 +368,29 @@ async def run_query(
             f"intent={effective_intent.value}"
         )
 
-        # Persist to in-memory history
-        append_to_history({
+        # Stream answer word by word first — don't let DB writes delay the first chunk
+        words = result.answer.split(" ")
+        for i, word in enumerate(words):
+            chunk = word if i == 0 else " " + word
+            yield _sse({"chunk": chunk, "done": False})
+            await asyncio.sleep(0.02)   
+
+        # Final done event with all data
+        yield _sse({
+            "question": result.question,
+            "sql": result.sql,
+            "results": display_results,
+            "all_results": all_results,
+            "row_count": len(display_results),
+            "total_rows": total_rows,
+            "page_size": page_size,
+            "strategy_used": result.strategy_used,
+            "error": None,
+            "done": True,
+        })
+
+        # Persist after streaming is complete — never block chunks on DB writes
+        await asyncio.to_thread(append_to_history, {
             "id": str(uuid.uuid4()),
             "question": result.question,
             "sql": result.sql,
@@ -358,11 +400,10 @@ async def run_query(
             "created_at": now,
         })
 
-        # Persist to MongoDB (chat messages)
         if x_chat_id and x_user_id:
             try:
                 db = get_data_db()
-                db["messages"].insert_many([
+                await asyncio.to_thread(db["messages"].insert_many, [
                     {
                         "_id": str(uuid.uuid4()),
                         "chat_id": x_chat_id,
@@ -384,32 +425,13 @@ async def run_query(
                         "created_at": now,
                     },
                 ])
-                db["chats"].update_one(
+                await asyncio.to_thread(
+                    db["chats"].update_one,
                     {"_id": x_chat_id},
                     {"$set": {"updated_at": now}},
                 )
             except Exception as e:
                 logger.warning(f"[STREAM] Failed to persist messages: {e}")
-
-        # Stream answer word by word
-        words = result.answer.split(" ")
-        for i, word in enumerate(words):
-            chunk = word if i == 0 else " " + word
-            yield _sse({"chunk": chunk, "done": False})
-
-        # Final done event with all data
-        yield _sse({
-            "question": result.question,
-            "sql": result.sql,
-            "results": display_results,
-            "all_results": all_results,
-            "row_count": len(display_results),
-            "total_rows": total_rows,
-            "page_size": page_size,
-            "strategy_used": result.strategy_used,
-            "error": None,
-            "done": True,
-        })
 
     return StreamingResponse(
         stream(),
