@@ -13,6 +13,20 @@ PAGINATION (how it works now):
     No regex scraping. No extracting numbers from LLM answer text.
     The offset is a plain integer that the frontend owns and tracks.
 
+FIX Bug 1 — known_total_rows:
+    On pagination calls the frontend also sends back the total_rows value it
+    received from the original query's done event. This is the true total (e.g.
+    28), not the batch size (10). The service uses it in build_answer_prompt so
+    the LLM can write an accurate footer ("Showing rows 11–20 of 28") instead of
+    treating the batch count as the total and always concluding "You have seen all
+    20 results."
+
+FIX Bug 2 — show_all:
+    When show_all=True, the service overrides the page_size cap with
+    MAX_RESULT_ROWS so the DB returns every remaining row at once. The quality
+    instruction is set to "show_all" which tells the LLM to render all rows with
+    an appropriate "all results shown" footer.
+
 SIGNAL HANDLING:
     If the LLM outputs a special signal (__OUT_OF_SCOPE__, __PRIVACY_BLOCK__,
     __CLARIFY__) instead of SQL, _parse_query raises ValueError which feeds
@@ -61,8 +75,6 @@ class QueryResponse:
 
 
 # ─── Special signal prefixes the LLM may output instead of SQL ───────────────
-# If the SQL generation LLM outputs one of these, we short-circuit before
-# hitting the DB and return the signal text as the answer directly.
 
 _SPECIAL_SIGNALS = ("__OUT_OF_SCOPE__", "__PRIVACY_BLOCK__", "__CLARIFY__")
 
@@ -100,18 +112,25 @@ class QueryService:
         context: list[dict] | None = None,
         intent: IntentType = IntentType.DB_QUERY,
         displayed_count: int = 0,
+        known_total_rows: int = 0,
+        show_all: bool = False,
     ) -> QueryResponse:
         """
         Execute the full pipeline for a natural language question.
 
         Args:
-            question:        The user's natural language question.
-            context:         Prior turns: [{"question": str, "sql": str, "answer": str}, ...]
-            intent:          Pre-classified intent. Defaults to DB_QUERY.
-                             Pass IntentType.PAGINATION when the user typed "show more".
-            displayed_count: Number of rows already shown to the user in the frontend.
-                             Used as OFFSET for pagination. Comes from the request body —
-                             no scraping or inference needed.
+            question:          The user's natural language question.
+            context:           Prior turns: [{"question": str, "sql": str, "answer": str}, ...]
+            intent:            Pre-classified intent. Defaults to DB_QUERY.
+                               Pass IntentType.PAGINATION when the user typed "show more".
+            displayed_count:   Number of rows already shown to the user in the frontend.
+                               Used as OFFSET for pagination. Comes from the request body.
+            known_total_rows:  FIX Bug 1. The true total row count from the original
+                               query, sent back by the frontend on pagination calls.
+                               When non-zero this overrides the batch row_count so the
+                               LLM can write an accurate "X of Y" footer.
+            show_all:          FIX Bug 2. When True, the PAGE_SIZE cap is removed and
+                               all remaining rows are fetched and displayed at once.
         """
         pipeline_start = time.perf_counter()
         is_pagination = (intent == IntentType.PAGINATION)
@@ -121,7 +140,9 @@ class QueryService:
             f"question={truncate(question, 120)} | "
             f"context_turns={len(context) if context else 0} | "
             f"intent={intent.value} | "
-            f"displayed_count={displayed_count}"
+            f"displayed_count={displayed_count} | "
+            f"known_total_rows={known_total_rows} | "
+            f"show_all={show_all}"
         )
 
         try:
@@ -129,7 +150,9 @@ class QueryService:
                 question,
                 context=context,
                 is_pagination=is_pagination,
-                pagination_offset=displayed_count,   # ← direct, no scraping
+                pagination_offset=displayed_count,
+                known_total_rows=known_total_rows,
+                show_all=show_all,
             )
 
             total_ms = int((time.perf_counter() - pipeline_start) * 1000)
@@ -137,6 +160,7 @@ class QueryService:
                 f"[PIPELINE] COMPLETE | "
                 f"strategy={result.strategy_used} | "
                 f"rows={result.row_count} | "
+                f"total_rows={result.total_rows} | "
                 f"total_latency={total_ms}ms"
             )
             return result
@@ -185,14 +209,16 @@ class QueryService:
         context: list[dict] | None = None,
         is_pagination: bool = False,
         pagination_offset: int = 0,
+        known_total_rows: int = 0,
+        show_all: bool = False,
     ) -> QueryResponse:
 
         ctx = context or []
 
         # ── 1. Schema retrieval ───────────────────────────────────────────────
-        # PAGINATION: Use the PREVIOUS question for schema retrieval, not "show
-        # more". "show more" has no semantic relationship to any table so FAISS
-        # would return random chunks. The previous question returns the right ones.
+        # PAGINATION / SHOW_ALL: Use the PREVIOUS question for schema retrieval,
+        # not "show more" / "show all". Those phrases have no semantic relation
+        # to any table so FAISS would return random chunks.
         if is_pagination and ctx:
             retrieval_question = self._get_previous_question(ctx)
             logger.info(
@@ -211,10 +237,18 @@ class QueryService:
             f"latency={schema_ms}ms"
         )
 
+        # FIX Bug 2: when show_all, override page_size to the max cap so the
+        # pagination prompt generates "LIMIT {max} OFFSET {offset}" instead of
+        # "LIMIT {page_size} OFFSET {offset}".
+        effective_page_size = (
+            self._settings.MAX_RESULT_ROWS if show_all else self._settings.PAGE_SIZE
+        )
+
         if is_pagination:
             logger.info(
                 f"[PAGINATION] offset={pagination_offset} | "
-                f"next_page={pagination_offset}–{pagination_offset + self._settings.PAGE_SIZE}"
+                f"effective_page_size={effective_page_size} | "
+                f"show_all={show_all}"
             )
 
         # ── 2. Generate query + execute ───────────────────────────────────────
@@ -224,6 +258,7 @@ class QueryService:
             context=ctx,
             is_pagination=is_pagination,
             pagination_offset=pagination_offset,
+            effective_page_size=effective_page_size,
         )
 
         # ── 3. Scrub sensitive data ───────────────────────────────────────────
@@ -232,18 +267,42 @@ class QueryService:
         scrub_ms = int((time.perf_counter() - t0) * 1000)
         logger.debug(f"[SCRUB] completed | latency={scrub_ms}ms")
 
-        # ── 4. Assess result quality ──────────────────────────────────────────
-        if is_pagination:
+        # ── 4. Resolve the true total row count ───────────────────────────────
+        # FIX Bug 1:
+        #   - Fresh query (is_pagination=False): the DB returns all matching rows,
+        #     so strategy_result.row_count IS the true total.
+        #   - Pagination (is_pagination=True): the DB returns only the current
+        #     batch (e.g. 10 rows). The actual total (e.g. 28) was captured on
+        #     the original query's done event and sent back by the frontend as
+        #     known_total_rows. Use that; fall back to the batch count only if
+        #     the frontend didn't send it (e.g. first-ever call to this code path).
+        batch_row_count = strategy_result.row_count
+        if is_pagination and known_total_rows > 0:
+            true_total = known_total_rows
+        else:
+            true_total = batch_row_count
+
+        logger.debug(
+            f"[TOTAL] batch={batch_row_count} | known_total={known_total_rows} | "
+            f"resolved_total={true_total} | is_pagination={is_pagination}"
+        )
+
+        # ── 5. Assess result quality ──────────────────────────────────────────
+        if show_all and is_pagination:
+            # All remaining rows at once — use dedicated quality instruction.
+            quality = "show_all"
+        elif is_pagination:
             quality = "pagination"
         else:
             quality = self._assess_result_quality(scrubbed_rows)
         logger.debug(f"[ANSWER] quality={quality}")
 
-        # ── 5. Generate NL answer ─────────────────────────────────────────────
+        # ── 6. Generate NL answer ─────────────────────────────────────────────
         answer_prompt = self._prompt_builder.build_answer_prompt(
             question=question,
             rows=scrubbed_rows,
-            row_count=strategy_result.row_count,
+            row_count=true_total,          # FIX Bug 1: pass true total
+            batch_row_count=batch_row_count,
             quality=quality,
             sql_query=strategy_result.query_used,
             context=ctx,
@@ -262,14 +321,14 @@ class QueryService:
             f"answer={truncate(answer, 120)}"
         )
 
-        # ── 6. Return ─────────────────────────────────────────────────────────
+        # ── 7. Return ─────────────────────────────────────────────────────────
         return QueryResponse(
             question=question,
             sql=strategy_result.query_used,
             results=scrubbed_rows,
             all_results=scrubbed_rows,
-            row_count=strategy_result.row_count,
-            total_rows=strategy_result.row_count,
+            row_count=batch_row_count,
+            total_rows=true_total,         # FIX Bug 1: expose true total upstream
             page_size=self._settings.PAGE_SIZE,
             strategy_used=strategy_result.strategy_name,
             answer=answer,
@@ -283,6 +342,7 @@ class QueryService:
         context: list[dict] | None = None,
         is_pagination: bool = False,
         pagination_offset: int = 0,
+        effective_page_size: int | None = None,
     ):
         """
         LLM query generation + strategy execution with retry loop.
@@ -299,13 +359,15 @@ class QueryService:
         attempt_history: list[AttemptRecord] = []
         last_exc: Exception | None = None
         max_attempts = self._settings.MAX_RETRIES
+        page_size = effective_page_size if effective_page_size is not None else self._settings.PAGE_SIZE
 
         for attempt in range(1, max_attempts + 1):
 
             logger.info(
                 f"[LLM_CALL] Attempt {attempt}/{max_attempts} | "
                 f"db_type={self.adapter.db_type} | "
-                f"is_pagination={is_pagination}"
+                f"is_pagination={is_pagination} | "
+                f"effective_page_size={page_size}"
             )
 
             t0 = time.perf_counter()
@@ -316,87 +378,87 @@ class QueryService:
                 context=ctx,
                 is_pagination=is_pagination,
                 pagination_offset=pagination_offset,
+                effective_page_size=page_size,
             )
-            prompt_ms = int((time.perf_counter() - t0) * 1000)
 
-            logger.debug(
-                f"[PROMPT] Built | latency={prompt_ms}ms | "
-                f"is_pagination={is_pagination} | "
-                f"has_retry_context={bool(attempt_history)}"
-            )
-            logger.debug(f"[PROMPT] User:\n{prompt['user'][:600]}")
-
-            # LLM generates raw query text
-            t0 = time.perf_counter()
-            raw_query_text = self.llm.generate_with_history([
-                {"role": "system", "content": prompt["system"]},
-                {"role": "user",   "content": prompt["user"]},
-            ])
-            llm_ms = int((time.perf_counter() - t0) * 1000)
-
-            logger.info(
-                f"[LLM_CALL] Response | attempt={attempt} | "
-                f"latency={llm_ms}ms | "
-                f"raw_output={truncate(raw_query_text, 150)}"
-            )
-            logger.debug(f"[LLM_CALL] Full output:\n{raw_query_text}")
-
-            # ── Signal check — intercept before hitting the DB ────────────────
-            # If the LLM returned a special signal instead of SQL, raise it
-            # immediately as a MaxRetriesExceeded so the caller surfaces the
-            # signal text as the answer rather than a database error.
-            stripped = raw_query_text.strip()
-            for signal in _SPECIAL_SIGNALS:
-                if stripped.startswith(signal):
-                    logger.info(f"[PARSE] Special signal detected: {signal}")
-                    raise MaxRetriesExceeded(stripped)
-
-            # ── Parse LLM output ──────────────────────────────────────────────
             try:
-                t0 = time.perf_counter()
-                generated_query = self._parse_query(raw_query_text)
-                parse_ms = int((time.perf_counter() - t0) * 1000)
+                raw_output = self.llm.generate_with_history([
+                    {"role": "system", "content": prompt["system"]},
+                    {"role": "user",   "content": prompt["user"]},
+                ])
+                llm_ms = int((time.perf_counter() - t0) * 1000)
                 logger.info(
-                    f"[PARSE] Success | attempt={attempt} | "
-                    f"query_type={type(generated_query).__name__} | "
-                    f"latency={parse_ms}ms | "
-                    f"parsed={truncate(str(generated_query), 150)}"
+                    f"[LLM_CALL] Output received | "
+                    f"latency={llm_ms}ms | "
+                    f"output={truncate(raw_output, 800)}"
                 )
-            except ValueError as parse_exc:
-                last_exc = parse_exc
-                attempt_history.append(AttemptRecord(attempt, raw_query_text, str(parse_exc)))
-                logger.warning(f"[PARSE] FAILED | attempt={attempt} | error={parse_exc}")
-                if attempt == max_attempts:
-                    raise MaxRetriesExceeded(str(parse_exc)) from parse_exc
+            except Exception as exc:
+                logger.warning(f"[LLM_CALL] LLM error on attempt {attempt}: {exc}")
+                last_exc = exc
+                attempt_history.append(AttemptRecord(
+                    attempt_number=attempt,
+                    query_used="(LLM call failed)",
+                    error=str(exc),
+                ))
                 continue
 
-            # ── Strategy execution ────────────────────────────────────────────
-            try:
-                t0 = time.perf_counter()
-                strategy_result = self.strategy.execute(question, generated_query)
-                exec_ms = int((time.perf_counter() - t0) * 1000)
-                logger.info(
-                    f"[STRATEGY] Success | "
-                    f"strategy={strategy_result.strategy_name} | "
-                    f"rows={strategy_result.row_count} | "
-                    f"latency={exec_ms}ms"
-                )
-                return strategy_result
+            # Check for special signals before trying to parse as SQL
+            stripped = raw_output.strip()
+            for signal in _SPECIAL_SIGNALS:
+                if stripped.startswith(signal):
+                    logger.info(f"[LLM_CALL] Special signal detected: {signal}")
+                    attempt_history.append(AttemptRecord(
+                        attempt_number=attempt,
+                        query_used=stripped,
+                        error=f"Signal: {signal}",
+                    ))
+                    last_exc = ValueError(stripped)
+                    break
+            else:
+                # No signal — try to parse and execute
+                try:
+                    parsed_query = self._parse_query(raw_output)
+                    logger.info(f"[PARSED_SQL]\n{parsed_query}")
+                    logger.info(f"[PARSED_TYPE] {type(parsed_query)}")
+                    t0 = time.perf_counter()
+                    print("====== RAW OUTPUT ======")
+                    print(raw_output)
+                    print("====== PARSED QUERY ======")
+                    print(parsed_query)
+                    print("====== TYPE ======")
+                    print(type(parsed_query))
+                    strategy_result = self.strategy.execute(question, parsed_query)
+                    exec_ms = int((time.perf_counter() - t0) * 1000)
+                    logger.info(
+                        f"[STRATEGY] Success on attempt {attempt} | "
+                        f"rows={strategy_result.row_count} | "
+                        f"latency={exec_ms}ms"
+                    )
+                    return strategy_result
+                except Exception as exc:
+                    logger.warning(
+                        f"[STRATEGY] Failed on attempt {attempt}: {exc} | "
+                        f"query={truncate(raw_output, 80)}"
+                    )
+                    last_exc = exc
+                    attempt_history.append(AttemptRecord(
+                        attempt_number=attempt,
+                        query_used=raw_output,
+                        error=str(exc),
+                    ))
+                    continue
 
-            except Exception as exec_exc:
-                last_exc = exec_exc
-                attempt_history.append(
-                    AttemptRecord(attempt, str(generated_query), str(exec_exc))
-                )
-                logger.warning(
-                    f"[STRATEGY] FAILED | attempt={attempt} | error={exec_exc}"
-                )
-                if attempt == max_attempts:
-                    raise MaxRetriesExceeded(str(exec_exc)) from exec_exc
+        # All attempts exhausted
+        last_signal = str(last_exc) if last_exc else "unknown error"
+        # If the last failure was a special signal, return it as the answer
+        for signal in _SPECIAL_SIGNALS:
+            if last_signal.startswith(signal):
+                raise MaxRetriesExceeded(last_signal)
+        raise MaxRetriesExceeded(
+            f"All {max_attempts} attempts failed. Last error: {last_signal}"
+        )
 
-        raise MaxRetriesExceeded(str(last_exc))
-
-    # ── Parse helpers ─────────────────────────────────────────────────────────
+        # ── Parse helpers ─────────────────────────────────────────────────────────
 
     def _parse_query(self, raw_text: str) -> str | dict:
         db_type = self.adapter.db_type
@@ -409,20 +471,30 @@ class QueryService:
     @staticmethod
     def _strip_sql(raw: str) -> str:
         sql = raw.strip()
+
+        # Remove markdown fences if present
         if sql.startswith("```"):
             lines = sql.split("\n")
-            inner = lines[1:] if lines[-1].strip() == "```" else lines[1:]
-            sql = "\n".join(line for line in inner if line.strip() != "```").strip()
+
+            # Remove first line (```sql or ```)
+            lines = lines[1:]
+
+            # Remove last line if it's ```
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+
+            sql = "\n".join(lines).strip()
+
         return sql
 
     @staticmethod
     def _parse_mongo_json(raw: str) -> dict:
         text = raw.strip()
-        if text.startswith("```"):
+        if text.startswith(""):
             lines = text.split("\n")
             text = "\n".join(
                 line for line in lines[1:]
-                if line.strip() not in ("```", "```json")
+                if line.strip() not in ("", "json")
             ).strip()
 
         start = text.find("{")
@@ -441,7 +513,7 @@ class QueryService:
             ) from exc
 
         if not isinstance(parsed, dict):
-            raise ValueError(f"Expected dict, got {type(parsed).__name__}")
+            raise ValueError(f"Expected dict, got {type(parsed)._name_}")
         if "collection" not in parsed:
             raise ValueError(
                 f"MongoDB query missing 'collection' key. Keys: {list(parsed.keys())}"
@@ -449,24 +521,46 @@ class QueryService:
 
         return parsed
 
-    def _assess_result_quality(self, rows: list[dict]) -> str:
-        count = len(rows)
-        if count == 0:
-            return "empty"
-        if count <= self._settings.PAGE_SIZE:
-            return "small"
-        return "large"
-
-    # ── Context helpers ───────────────────────────────────────────────────────
-
     def _get_previous_question(self, context: list[dict]) -> str:
-        """
-        Extract the most recent user question from context.
-        Used as the retrieval question for pagination so FAISS returns
-        the same schema chunks as the original query, not random ones for "show more".
-        """
+        """Return the most recent user question from context."""
         for turn in reversed(context):
             q = turn.get("question", "").strip()
             if q:
                 return q
-        return "data query"
+        return ""
+
+    def _get_last_sql(self, context: list[dict]) -> str:
+        """Return the most recent SQL from context."""
+        for turn in reversed(context):
+            sql = turn.get("sql", "").strip()
+            if sql:
+                return sql
+        return ""
+
+    def _assess_result_quality(self, rows: list[dict]) -> str:
+        """
+        Assess result quality for fresh (non-pagination) queries.
+
+        Returns a quality label understood by prompt_builder:
+          'empty'        — no rows
+          'all_null'     — rows present but all values null/empty
+          'low_relevance'— rows seem unrelated (future heuristic)
+          'small'        — rows fit within one page
+          'large'        — rows exceed one page
+        """
+        if not rows:
+            return "empty"
+
+        # Check if all values are null/empty
+        all_null = all(
+            v is None or v == "" or v == []
+            for row in rows
+            for v in row.values()
+        )
+        if all_null:
+            return "all_null"
+
+        if len(rows) > self._settings.PAGE_SIZE:
+            return "large"
+
+        return "small"

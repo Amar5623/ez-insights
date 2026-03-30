@@ -7,22 +7,24 @@
  *
  * PAGINATION CHANGES
  * ──────────────────
- * The backend now returns three extra fields on every SSE "done" event:
- *   - all_results  : all rows the DB returned (up to MAX_RESULT_ROWS)
- *   - total_rows   : true total in the DB (may exceed all_results.length)
- *   - page_size    : backend page size (from settings.PAGE_SIZE)
+ * The backend returns three extra fields on every SSE "done" event:
+ *   - total_rows : true total in the DB for this query
+ *   - page_size  : backend page size (from settings.PAGE_SIZE)
  *
- * chat-context stores these on each assistant ChatMessage so that
- * chat-messages.tsx can render a results table and offer paging controls.
+ * chat-context stores total_rows on each assistant ChatMessage so it can be
+ * sent back to the backend on every subsequent pagination request.
  *
- * showMore(messageId) implements two tiers of "show more":
- *   1. Client-side expand — if all_results has rows beyond what's currently
- *      shown in `results`, slice the next page_size rows and update the
- *      message locally. Zero network cost.
- *   2. Server-side load — if the user has exhausted all_results but
- *      total_rows > all_results.length, send a new SSE query with
- *      displayed_count = all_results.length so the backend generates
- *      SQL with the correct OFFSET and returns the next batch.
+ * FIX Bug 1 — accurate footer:
+ *   When the user says "show more", we read the previous assistant message's
+ *   total_rows and include it in the sendQuery body as `total_rows`. The backend
+ *   uses it in the answer prompt so the footer always says "X of 28" instead of
+ *   "X of 10" (the batch count).
+ *
+ * FIX Bug 2 — show all remaining:
+ *   When the user's message matches a "show all" phrase, we set show_all=true
+ *   in the sendQuery body. The backend removes the PAGE_SIZE cap and returns all
+ *   remaining rows at once. The displayed_count is still sent so the SQL gets the
+ *   right OFFSET (rows 11–28, not rows 1–28 again).
  */
 
 import {
@@ -51,8 +53,8 @@ import { useAuth } from './auth-context'
 interface ChatContextType {
   chats: Chat[]
   currentChat: Chat | null
-  isLoading: boolean    // true while fetching chats / messages from remote
-  isSending: boolean    // true while an SSE query is in flight
+  isLoading: boolean
+  isSending: boolean
   sendMessage: (text: string) => void
   createNewChat: () => void
   selectChat: (id: string) => void
@@ -74,7 +76,6 @@ function buildContext(
   const context: Array<{ question: string; sql: string; answer: string }> = []
   for (const msg of messages) {
     if (msg.role === 'assistant' && msg.content && !msg.isLoading) {
-      // Walk backwards to find the paired user message (the question)
       const idx = messages.indexOf(msg)
       const prev = messages[idx - 1]
       if (prev?.role === 'user') {
@@ -86,8 +87,100 @@ function buildContext(
       }
     }
   }
-  // Backend only needs recent context — keep last 6 pairs
   return context.slice(-6)
+}
+
+/**
+ * FIX Bug 2: detect "show all remaining" phrasing.
+ * Keep this list in sync with SHOW_ALL_PATTERNS in backend intent_classifier.py.
+ */
+const SHOW_ALL_PHRASES = [
+  /^\s*show\s+all\s*$/i,
+  /^\s*show\s+all\s+remaining\s*$/i,
+  /^\s*show\s+all\s+results?\s*$/i,
+  /^\s*show\s+all\s+rows?\s*$/i,
+  /^\s*show\s+everything\s*$/i,
+  /^\s*show\s+the\s+rest\s*$/i,
+  /^\s*show\s+remaining\s*$/i,
+  /^\s*show\s+rest\s*$/i,
+  /^\s*load\s+all\s*$/i,
+  /^\s*load\s+all\s+remaining\s*$/i,
+  /^\s*load\s+everything\s*$/i,
+  /^\s*get\s+all\s+remaining\s*$/i,
+  /^\s*get\s+everything\s*$/i,
+  /^\s*see\s+all\s*$/i,
+  /^\s*see\s+all\s+remaining\s*$/i,
+  /^\s*see\s+everything\s*$/i,
+  /^\s*view\s+all\s*$/i,
+  /^\s*view\s+all\s+remaining\s*$/i,
+  /^\s*view\s+everything\s*$/i,
+  /^\s*give\s+me\s+all\s*$/i,
+  /^\s*give\s+me\s+all\s+remaining\s*$/i,
+  /^\s*give\s+me\s+everything\s*$/i,
+  /^\s*show\s+all\s+of\s+them\s*$/i,
+  /^\s*show\s+me\s+all\s*$/i,
+  /^\s*show\s+me\s+everything\s*$/i,
+  /^\s*show\s+me\s+the\s+rest\s*$/i,
+  /^\s*show\s+me\s+all\s+remaining\s*$/i,
+  /^\s*all\s+remaining\s*$/i,
+  /^\s*all\s+results?\s*$/i,
+  /^\s*all\s+rows?\s*$/i,
+  /^\s*everything\s*$/i,
+  /^\s*rest\s+of\s+(them|it|the\s+results?)\s*$/i,
+]
+
+/**
+ * Standard "show more" patterns (next page only, no "all" signal).
+ * Used to decide whether to pass displayed_count to the backend.
+ */
+const SHOW_MORE_PHRASES = [
+  /^\s*more\s*$/i,
+  /^\s*next\s*$/i,
+  /^\s*continue\s*$/i,
+  /^\s*show\s+more\s*$/i,
+  /^\s*load\s+more\s*$/i,
+  /^\s*next\s+page\s*$/i,
+  /^\s*show\s+next\s+page\s*$/i,
+  /^\s*more\s+results?\s*$/i,
+  /^\s*show\s+\d+\s+more\s*$/i,
+  /^\s*next\s+\d+\s*$/i,
+  /^\s*give\s+me\s+more\s*$/i,
+  /^\s*load\s+next\s*$/i,
+  /^\s*show\s+more\s+results?\s*$/i,
+  /^\s*get\s+more\s*$/i,
+  /^\s*see\s+more\s*$/i,
+  /^\s*view\s+more\s*$/i,
+]
+
+function isShowAll(text: string): boolean {
+  return SHOW_ALL_PHRASES.some(p => p.test(text.trim()))
+}
+
+function isShowMore(text: string): boolean {
+  return SHOW_MORE_PHRASES.some(p => p.test(text.trim()))
+}
+
+/**
+ * Walk backwards through messages to find the last assistant message that has
+ * a row_count > 0. Returns { displayedCount, totalRows } or null if not found.
+ *
+ * FIX Bug 1: We read total_rows (the true total from the original query) so
+ * we can send it back to the backend on pagination calls.
+ */
+function getPaginationState(messages: ChatMessage[]): {
+  displayedCount: number
+  totalRows: number
+} | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]
+    if (msg.role === 'assistant' && !msg.isLoading && (msg.row_count ?? 0) > 0) {
+      return {
+        displayedCount: msg.row_count ?? 0,
+        totalRows: msg.total_rows ?? 0,
+      }
+    }
+  }
+  return null
 }
 
 // ── Provider ───────────────────────────────────────────────────────────────────
@@ -100,7 +193,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   const [isLoading, setIsLoading] = useState(false)
   const [isSending, setIsSending] = useState(false)
 
-  // Ref so SSE callbacks always see fresh chats without stale closure issues
   const chatsRef = useRef(chats)
   useEffect(() => { chatsRef.current = chats }, [chats])
 
@@ -122,7 +214,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
           return
         }
 
-        // Map remote chats → local Chat (messages loaded lazily on selectChat)
         const localChats: Chat[] = remoteChats.map(rc => ({
           id: rc.id,
           title: rc.title,
@@ -132,7 +223,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         }))
         setChats(localChats)
 
-        // Auto-select the most recent chat and load its messages
         const latest = remoteChats[0]
         setCurrentChatId(latest.id)
         setActiveChatContext(latest.id, user.id)
@@ -152,7 +242,7 @@ export function ChatProvider({ children }: { children: ReactNode }) {
             prev.map(c => (c.id === latest.id ? { ...c, messages: local } : c)),
           )
         } catch {
-          // Non-fatal — chat opens empty
+          // Non-fatal
         }
       })
       .catch(() => {
@@ -178,7 +268,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       setCurrentChatId(remote.id)
       setActiveChatContext(remote.id, user.id)
     } catch {
-      // Fallback: create a local-only chat (won't persist across reload)
       const id = makeId()
       const newChat: Chat = { id, title: 'New Chat', messages: [], created_at: new Date().toISOString(), updated_at: new Date().toISOString() }
       setChats(prev => [newChat, ...prev])
@@ -195,7 +284,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     const chat = chatsRef.current.find(c => c.id === id)
     if (!chat || chat.messages.length > 0 || !user) return
 
-    // Lazy-load messages for this chat
     try {
       const msgs = await fetchMessages(id, user.id)
       const local: ChatMessage[] = msgs.map(m => ({
@@ -225,7 +313,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
 
     if (user) {
       deleteChatAPI(id, user.id).catch(() => {
-        // Restore on failure
         const deleted = chatsRef.current.find(c => c.id === id)
         if (deleted) setChats(prev => [deleted, ...prev])
       })
@@ -256,7 +343,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
     (text: string) => {
       if (isSending || !text.trim()) return
 
-      // Auto-create a chat if none is active
       const runWithChat = async (chatId: string) => {
         const currentMessages =
           chatsRef.current.find(c => c.id === chatId)?.messages ?? []
@@ -290,11 +376,32 @@ export function ChatProvider({ children }: { children: ReactNode }) {
         setIsSending(true)
         let accumulated = ''
 
+        // ── Determine pagination parameters ────────────────────────────────
+        const showAll = isShowAll(text)
+        const showMore = isShowMore(text)
+        const isPagination = showAll || showMore
+
+        // FIX Bug 1 & Bug 2: find how many rows have been displayed and what
+        // the true total is, so we can send both to the backend.
+        const paginationState = isPagination
+          ? getPaginationState(currentMessages)
+          : null
+
+        const displayed_count = paginationState?.displayedCount ?? 0
+
+        // FIX Bug 1: send back the true total so the backend footer is accurate.
+        const total_rows = paginationState?.totalRows ?? 0
+
+        // FIX Bug 2: tell the backend to drop the PAGE_SIZE cap.
+        const show_all = showAll
+
         await sendQuery(
           {
             question: text,
             context: buildContext(currentMessages),
-            displayed_count: 0, // Fresh query always starts at offset 0
+            displayed_count,   // OFFSET for the next SQL page
+            total_rows,        // FIX Bug 1: true total from original query
+            show_all,          // FIX Bug 2: remove page cap
           },
           // onChunk — stream words into the assistant bubble
           (chunk) => {
@@ -304,15 +411,18 @@ export function ChatProvider({ children }: { children: ReactNode }) {
               isLoading: false,
             })
           },
-          // onDone — store metadata; the LLM already streamed the formatted
-          // answer text (intro + table + footer) via onChunk above.
+          // onDone — store metadata including total_rows for future pagination calls
           (meta) => {
             patchMessage(chatId, assistantId, {
               content: accumulated || meta.answer || '',
               isLoading: false,
               sql: meta.sql,
               strategy_used: meta.strategy_used,
-              row_count: meta.row_count,
+              // FIX Bug 1: store the running displayed count (offset + this batch)
+              // so the next pagination call can send the right displayed_count.
+              row_count: (displayed_count) + (meta.row_count ?? 0),
+              // FIX Bug 1: store the true total so we can send it back next time.
+              total_rows: meta.total_rows ?? 0,
             })
 
             setIsSending(false)
@@ -331,7 +441,6 @@ export function ChatProvider({ children }: { children: ReactNode }) {
       if (currentChatId) {
         runWithChat(currentChatId)
       } else {
-        // No active chat — create one first, then send
         ;(async () => {
           if (!user) return
           try {

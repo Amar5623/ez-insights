@@ -7,33 +7,38 @@ KEY DESIGN DECISIONS:
 
 1. db_context_markdown is NOT injected into the SQL generation user message.
    It lives in sql_system.md (the system prompt) as the BUSINESS CONTEXT section.
-   Injecting it again in the user message caused the LLM to see the same domain
-   facts (revenue formula, join rules, valid enum values) 2-3 times per call,
-   which wastes tokens and can cause the model to oscillate between phrasings.
 
 2. Pagination uses a completely separate, minimal prompt (_PAGINATION_PROMPT_TEMPLATE).
    The previous SQL is pulled from context and handed directly to the LLM.
    The OFFSET is a plain integer (pagination_offset) passed in from the request —
    no regex scraping of answer text needed.
-   The LLM's only job is: "take this SQL, replace LIMIT/OFFSET with these numbers."
 
 3. Special signals (__OUT_OF_SCOPE__, __PRIVACY_BLOCK__, __CLARIFY__) are detected
    in query_service before _parse_query() is called, so they never reach the DB.
 
 4. Retry context (attempt_history) is injected into the user message so the LLM
-   can see exactly what it tried and what error it got. The schema chunks are also
-   present in the retry prompt so the LLM can look up the correct column name.
+   can see exactly what it tried and what error it got.
+
+FIX Bug 1 — row_count vs batch_row_count:
+   build_answer_prompt now accepts two separate row counts:
+     row_count        — the TRUE total (e.g. 28). Used in footer text and quality
+                        instructions so the LLM always says "X of 28".
+     batch_row_count  — how many rows are actually in the prompt (e.g. 10).
+                        Used to cap the preview sent to the LLM and to compute
+                        offset_end accurately.
+
+FIX Bug 2 — show_all quality instruction:
+   A new "show_all" quality label is handled. It tells the LLM to render all
+   rows in the prompt with no "show more" footer and a clean "all results shown"
+   conclusion. The pagination prompt also accepts effective_page_size so that
+   "show all" generates LIMIT {MAX_RESULT_ROWS} OFFSET {offset} instead of
+   LIMIT {PAGE_SIZE} OFFSET {offset}.
 
 ANSWER FORMAT CONTRACT (enforced via _QUALITY_INSTRUCTIONS):
    Every non-empty DB response must follow this exact 3-part structure:
-     1. One or two sentences introducing the result
-        e.g. "Here are the top 10 customers by revenue:"
-     2. A markdown table of exactly PAGE_SIZE rows (or all rows if fewer)
-     3. A single footer line if more rows exist:
-        "_Showing {page_size} of {total_rows} total rows.
-         Say **show more** to see the next {page_size}._"
-   This keeps the chat clean: the LLM streams the full formatted response
-   and the user types "show more" to paginate — no separate UI widget needed.
+     1. One sentence introducing the result
+     2. A markdown table
+     3. A footer line showing pagination state (or "all shown" if complete)
 """
 
 import json
@@ -45,10 +50,6 @@ logger = get_logger(__name__)
 
 
 # ── SQL generation user message template ──────────────────────────────────────
-# NOTE: db_context is intentionally absent here.
-# It lives in sql_system.md (system prompt) as the BUSINESS CONTEXT section.
-# Adding it here as well caused triple-duplication when combined with the
-# enriched FAISS chunks which also contain domain knowledge.
 
 _SQL_USER_TEMPLATE = """## RAG-Retrieved Schema (most relevant tables for this question)
 {schema_context}
@@ -65,9 +66,8 @@ _SQL_USER_TEMPLATE = """## RAG-Retrieved Schema (most relevant tables for this q
 
 # ── Pagination-specific prompt ────────────────────────────────────────────────
 # Used INSTEAD of the normal template when is_pagination=True.
-# Gives the LLM the exact previous SQL and tells it precisely what to change.
-# The LLM cannot hallucinate the wrong table — the SQL already specifies it.
-# The offset is a plain integer from the frontend — no inference needed.
+# FIX Bug 2: effective_page_size replaces the hard-coded page_size so "show all"
+# can pass MAX_RESULT_ROWS here, generating a LIMIT with no practical cap.
 
 _PAGINATION_PROMPT_TEMPLATE = """## Task
 The user wants to see the next page of results from their previous query.
@@ -129,23 +129,16 @@ _ANSWER_USER_TEMPLATE = """## Conversation Context
 
 
 # ── Quality instructions ──────────────────────────────────────────────────────
-# These enforce the 3-part answer format:
-#   Part 1 — 1-2 sentence intro  ("Here are the top customers you asked for:")
-#   Part 2 — markdown table      (capped at PAGE_SIZE rows)
-#   Part 3 — footer line         ("Showing 10 of 47 total rows. Say show more...")
-#
 # IMPORTANT PLACEHOLDERS:
-#   {total_rows} — total rows returned by the DB for this query
-#   {page_size}  — rows per page from settings (what the user sees at a time)
-#   {offset_start} / {offset_end} — row range for pagination turns
-#
-# Any instruction containing those placeholders is automatically formatted by
-# build_answer_prompt() before being sent to the LLM.
+#   {total_rows}    — TRUE total rows in the DB for this query (e.g. 28)
+#   {batch_rows}    — rows actually in this prompt / being shown now (e.g. 10)
+#   {page_size}     — rows per page from settings
+#   {offset_start}  — first row number shown in this batch (1-based)
+#   {offset_end}    — last row number shown in this batch
 
 _QUALITY_INSTRUCTIONS: dict[str, str] = {
 
     # ── All results fit in one page ──────────────────────────────────────────
-    # Row count ≤ PAGE_SIZE: show everything, no footer needed.
     "small": (
         "Structure your response in exactly two parts:\n"
         "1. ONE sentence introducing what the data shows "
@@ -160,7 +153,6 @@ _QUALITY_INSTRUCTIONS: dict[str, str] = {
     ),
 
     # ── More rows than one page ──────────────────────────────────────────────
-    # Row count > PAGE_SIZE: show first PAGE_SIZE rows and prompt for more.
     "large": (
         "Structure your response in exactly three parts:\n"
         "1. ONE sentence introducing what the data shows "
@@ -177,18 +169,59 @@ _QUALITY_INSTRUCTIONS: dict[str, str] = {
     ),
 
     # ── User asked for the next page ─────────────────────────────────────────
+    # FIX Bug 1: offset_end is computed from batch_rows (not total_rows) so it
+    # correctly says "rows 11–20" not "rows 11–28".
     "pagination": (
-        "Structure your response in exactly three parts:\n"
-        "1. ONE sentence confirming which page this is "
-        "(e.g. 'Here are rows {offset_start}–{offset_end} of {total_rows}:'). "
+        "You are formatting paginated query results.\n\n"
+
+        "FIRST — detect if the user is requesting more results AFTER all rows have already been shown.\n"
+        "If ALL results have already been displayed previously, respond with EXACTLY:\n"
+        "_You have now seen all results of your previous query. How else can I help you?_\n"
+        "Do NOT follow any further structure.\n\n"
+
+        "SECOND — otherwise, format the current page strictly using the rules below.\n\n"
+
+        "Determine if this is the last page:\n"
+        "- Last page if {offset_end} >= {total_rows}\n"
+        "- Otherwise, more rows remain\n\n"
+
+        "IMPORTANT EDGE CASE:\n"
+        "- The last page may contain fewer rows than the page size\n"
+        "- Even if only a partial set of rows is shown (e.g., 6 of 10), it is STILL the last page if {offset_end} >= {total_rows}\n\n"
+
+        "Now structure the response in EXACTLY three parts:\n\n"
+
+        "1. ONE sentence confirming which rows are shown:\n"
+        "'Here are rows {offset_start}–{offset_end} of {total_rows}:'\n"
+        "- Do NOT repeat or restate the user’s question\n\n"
+
+        "2. Present the rows as a markdown table\n\n"
+
+        "3. Closing line:\n"
+        "- If MORE rows remain ({offset_end} < {total_rows}), end with EXACTLY:\n"
+        "_Showing rows {offset_start}–{offset_end} of {total_rows}. Say **show more** for the next page._\n\n"
+
+        "- If this is the LAST page ({offset_end} >= {total_rows}), end with EXACTLY:\n"
+        "_You have now seen all {total_rows} results. How else can I help you?_\n\n"
+
+        "STRICT RULES:\n"
+        "- Never mix both endings\n"
+        "- Never guess row counts\n"
+        "- Never produce extra explanation\n"
+        "- Follow formatting EXACTLY"
+    ),
+
+    # FIX Bug 2 — user said "show all remaining" ─────────────────────────────
+    # All unseen rows are in the prompt at once. The LLM shows them all and
+    # closes with a clean "all X results shown" statement.
+    "show_all": (
+        "Structure your response in exactly two parts:\n"
+        "1. ONE sentence confirming the user is now seeing all remaining results "
+        "(e.g. 'Here are the remaining {batch_rows} results, "
+        "completing all {total_rows} total:'). "
         "Do not repeat the user's question verbatim.\n"
-        "2. Present the rows as a markdown table.\n"
-        "3. If more rows remain after this page ({offset_end} < {total_rows}), "
-        "end with EXACTLY:\n"
-        "_Showing rows {offset_start}–{offset_end} of {total_rows}. "
-        "Say **show more** for the next page._\n"
-        "If this is the last page ({offset_end} >= {total_rows}), "
-        "end with EXACTLY:\n"
+        "2. Present ALL {batch_rows} rows as a markdown table.\n"
+        "End with EXACTLY this line and nothing after it:\n"
         "_You have now seen all {total_rows} results._"
     ),
 
@@ -236,51 +269,50 @@ class PromptBuilder:
         context: list[dict] | None = None,
         is_pagination: bool = False,
         pagination_offset: int = 0,
+        effective_page_size: int | None = None,
     ) -> dict[str, str]:
         """
         Build the SQL or Mongo query generation prompt.
 
         Args:
-            question:          The user's natural language question.
-            schema_chunks:     Top-K schema chunks from SchemaRetriever.retrieve().
-            attempt_history:   List of AttemptRecord from prior failed attempts.
-            context:           Prior conversation turns: [{"question", "sql", "answer"}, ...]
-            is_pagination:     True when the user typed "show more" / "next".
-            pagination_offset: How many rows the user has already seen (used as OFFSET).
-                               This is a plain integer from the frontend — never inferred.
+            question:            The user's natural language question.
+            schema_chunks:       Top-K schema chunks from SchemaRetriever.retrieve().
+            attempt_history:     List of AttemptRecord from prior failed attempts.
+            context:             Prior conversation turns.
+            is_pagination:       True when the user typed "show more" / "show all".
+            pagination_offset:   How many rows the user has already seen (OFFSET).
+            effective_page_size: FIX Bug 2. Overrides PAGE_SIZE for the LIMIT
+                                 clause. Pass MAX_RESULT_ROWS for show_all requests.
 
         Returns {"system": ..., "user": ...}
         """
         cfg = get_client_config()
         from core.config.settings import get_settings
         settings = get_settings()
+        page_size = effective_page_size if effective_page_size is not None else settings.PAGE_SIZE
 
         # ── Pagination path ───────────────────────────────────────────────────
-        # Completely different prompt — explicit SQL + LIMIT/OFFSET.
-        # Schema chunks not needed: the SQL already encodes the right tables.
         if is_pagination and context:
             previous_sql = self._get_last_sql(context)
             if previous_sql:
-                page_size = settings.PAGE_SIZE
                 user_content = _PAGINATION_PROMPT_TEMPLATE.format(
                     previous_sql=previous_sql,
                     page_size=page_size,
                     current_offset=pagination_offset,
-                    next_offset=pagination_offset + page_size,
+                    next_offset=pagination_offset,
                     question=question,
                 )
                 logger.info(
                     f"[PROMPT] Built PAGINATION prompt | "
                     f"previous_sql={truncate(previous_sql, 80)} | "
-                    f"offset={pagination_offset} → {pagination_offset + page_size}"
+                    f"offset={pagination_offset} | "
+                    f"effective_page_size={page_size}"
                 )
                 return {
                     "system": cfg.sql_system_prompt,
                     "user": user_content,
                 }
             else:
-                # No previous SQL found — fall through to normal prompt.
-                # This can happen if the user's first message is "show more".
                 logger.warning(
                     "[PROMPT] Pagination requested but no previous SQL found in context — "
                     "falling through to normal SQL generation prompt"
@@ -334,18 +366,24 @@ class PromptBuilder:
         sql_query: str = "",
         context: list[dict] | None = None,
         pagination_offset: int = 0,
+        batch_row_count: int | None = None,
     ) -> dict[str, str]:
         """
         Build the natural language answer generation prompt.
 
         Args:
-            question:          The original user question.
-            rows:              Result rows from the DB (already scrubbed).
-            row_count:         Total rows returned by the query.
-            quality:           'small' | 'large' | 'pagination' | 'empty' | ...
-            sql_query:         The SQL/Mongo query that ran (for transparency).
-            context:           Prior conversation turns.
+            question:         The original user question.
+            rows:             Result rows from the DB (already scrubbed).
+            row_count:        FIX Bug 1. TRUE total rows for this query (e.g. 28).
+                              Used in footer text so the LLM always says "X of 28".
+            quality:          'small' | 'large' | 'pagination' | 'show_all' | 'empty' | ...
+            sql_query:        The SQL/Mongo query that ran (for transparency).
+            context:          Prior conversation turns.
             pagination_offset: Rows already shown before this page (for pagination text).
+            batch_row_count:  FIX Bug 1. Number of rows actually in `rows` (the
+                              current batch, e.g. 10). When None, defaults to
+                              len(rows). Used to compute offset_end and to cap the
+                              preview sent to the LLM.
         """
         from core.config.settings import get_settings
         cfg = get_client_config()
@@ -353,10 +391,13 @@ class PromptBuilder:
         max_for_llm = settings.MAX_ROWS_FOR_LLM
         page_size = settings.PAGE_SIZE
 
-        # For the "large" quality path, only send PAGE_SIZE rows to the LLM —
-        # sending more would let the LLM accidentally include extra rows in the
-        # markdown table despite the instruction to cap at page_size.
-        # For "small", send all rows (they all fit in one page by definition).
+        # batch_rows is how many rows are actually in this batch/prompt.
+        # row_count (true_total) is the grand total across all pages.
+        batch_rows = batch_row_count if batch_row_count is not None else len(rows)
+        true_total = row_count  # renamed for clarity in this scope
+
+        # Cap rows sent to LLM. For "large" quality, only send PAGE_SIZE rows so
+        # the LLM can't accidentally include extra rows in the table.
         if quality == "large":
             preview_rows = rows[:page_size]
         else:
@@ -373,22 +414,25 @@ class PromptBuilder:
         except Exception:
             results_preview = "\n".join(str(row) for row in cleaned)
 
-        if row_count > len(preview_rows):
+        if true_total > len(preview_rows):
             results_preview += (
-                f"\n\n(Showing {len(preview_rows)} of {row_count} total rows in this prompt.)"
+                f"\n\n(Showing {len(preview_rows)} of {true_total} total rows in this prompt.)"
             )
 
-        # Resolve quality instruction, substituting numeric placeholders
+        # Resolve quality instruction, substituting numeric placeholders.
+        # FIX Bug 1: offset_end uses batch_rows (not true_total) so the range
+        # reads "rows 11–20", not "rows 11–28".
         raw_instruction = _QUALITY_INSTRUCTIONS.get(quality, _QUALITY_INSTRUCTIONS["small"])
 
-        offset_end = pagination_offset + len(preview_rows)
+        offset_end = pagination_offset + batch_rows
 
         if any(
             ph in raw_instruction
-            for ph in ("{total_rows}", "{page_size}", "{offset_start}", "{offset_end}")
+            for ph in ("{total_rows}", "{page_size}", "{offset_start}", "{offset_end}", "{batch_rows}")
         ):
             quality_instruction = raw_instruction.format(
-                total_rows=row_count,
+                total_rows=true_total,
+                batch_rows=batch_rows,
                 page_size=page_size,
                 offset_start=pagination_offset + 1,
                 offset_end=offset_end,
@@ -403,7 +447,7 @@ class PromptBuilder:
             context=context_text,
             question=question,
             sql_query=sql_query or "(not available)",
-            row_count=row_count,
+            row_count=true_total,
             results_preview=results_preview or "(no rows returned)",
             quality_instruction=quality_instruction,
         )
@@ -411,8 +455,9 @@ class PromptBuilder:
         logger.debug(
             f"[PROMPT] Built answer prompt | "
             f"quality={quality} | "
-            f"rows_in_prompt={len(preview_rows)}/{row_count} | "
-            f"pagination_offset={pagination_offset} | "
+            f"batch_rows={batch_rows} | "
+            f"true_total={true_total} | "
+            f"offset={pagination_offset}→{offset_end} | "
             f"context_turns={len(context) if context else 0}"
         )
 
@@ -436,61 +481,39 @@ class PromptBuilder:
     def _format_context_for_sql(self, context: list[dict]) -> str:
         """
         Format prior turns for the SQL generation prompt.
-
         Includes the question AND the SQL so the LLM understands what it
-        was querying. The answer is excluded — it's verbose and irrelevant
-        to generating the next SQL query.
+        previously queried.
         """
         if not context:
-            return "(First message — no prior conversation turns)"
-
-        lines = [
-            "The user has been asking questions in this session. "
-            "Here are the prior turns:"
-        ]
-        for i, turn in enumerate(context[-5:], 1):
+            return "None"
+        lines = []
+        for turn in context[-4:]:  # last 4 turns
             q = turn.get("question", "").strip()
             sql = turn.get("sql", "").strip()
             if q:
-                lines.append(f"  Turn {i}: User asked: \"{q}\"")
+                lines.append(f"User: {q}")
             if sql:
-                lines.append(f"           SQL executed: {sql}")
-
-        lines.append("")
-        lines.append(
-            "Use this context to understand what the user is referring to. "
-            "If the current question is a follow-up, build on the previous SQL."
-        )
-
-        return "\n".join(lines)
+                lines.append(f"SQL: {sql}")
+        return "\n".join(lines) if lines else "None"
 
     def _format_context_for_answer(self, context: list[dict]) -> str:
-        """
-        Format prior turns for the answer generation prompt.
-
-        Includes question + answer (not SQL) so the LLM can write a
-        contextually relevant follow-up answer.
-        """
+        """Format prior turns for the answer generation prompt."""
         if not context:
-            return "(No prior conversation)"
-
+            return "None"
         lines = []
-        for i, turn in enumerate(context[-3:], 1):
+        for turn in context[-3:]:  # last 3 turns
             q = turn.get("question", "").strip()
             a = turn.get("answer", "").strip()
             if q:
-                lines.append(f"Turn {i} — User: {q}")
+                lines.append(f"User: {q}")
             if a:
-                # Truncate long answers to avoid bloating the prompt
-                truncated = a[:300] + "…" if len(a) > 300 else a
-                lines.append(f"Turn {i} — Assistant: {truncated}")
+                lines.append(f"Assistant: {a[:300]}{'...' if len(a) > 300 else ''}")
+        return "\n".join(lines) if lines else "None"
 
-        return "\n".join(lines)
-
-    def _get_last_sql(self, context: list[dict]) -> str | None:
-        """Return the most recent SQL from the conversation context."""
+    def _get_last_sql(self, context: list[dict]) -> str:
+        """Return the most recent SQL from context."""
         for turn in reversed(context):
             sql = turn.get("sql", "").strip()
             if sql:
                 return sql
-        return None
+        return ""

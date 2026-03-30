@@ -62,6 +62,7 @@ export interface ChatMessage {
   strategy_used?: string
   timestamp: Date
   row_count?: number
+  total_rows?: number
 }
 
 export interface Chat {

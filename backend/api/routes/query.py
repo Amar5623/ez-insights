@@ -25,6 +25,16 @@ PAGINATION:
     prompt_builder builds a tight "take previous SQL, add LIMIT X OFFSET Y" prompt.
     No regex scraping. No guessing. The offset is a plain integer from the client.
 
+    FIX Bug 1: The frontend also sends body.total_rows — the true total from the
+    original query. On pagination turns this is forwarded to the service so
+    prompt_builder can use it for the footer instead of the batch row_count.
+
+SHOW_ALL:
+    FIX Bug 2: When user types "show all remaining", the intent classifier marks
+    it as SHOW_ALL. query.py sets show_all=True and passes it to service.run().
+    The service overrides PAGE_SIZE with MAX_RESULT_ROWS so the DB returns all
+    remaining rows at once with no cap.
+
 HELP intent:
     Handled without an LLM call — _build_help_answer() constructs the response
     directly from ClientConfig. Greetings, chat, farewell use _build_conversational_system_prompt()
@@ -56,11 +66,6 @@ settings = get_settings()
 # ─── Conversational helpers ───────────────────────────────────────────────────
 
 def _build_conversational_system_prompt() -> str:
-    """
-    System prompt for conversational (non-DB) responses.
-    Reads ClientConfig so the assistant stays in character for this deployment.
-    Falls back to a safe generic string if config is unavailable.
-    """
     try:
         cfg = get_client_config()
         return (
@@ -76,10 +81,6 @@ def _build_conversational_system_prompt() -> str:
 
 
 def _build_help_answer() -> str:
-    """
-    Build a structured HELP response from ClientConfig without calling the LLM.
-    Falls back to a safe generic message if ClientConfig is unavailable.
-    """
     try:
         cfg = get_client_config()
 
@@ -150,7 +151,12 @@ async def run_query(
 ):
     question = body.question
     context = body.context or []
-    displayed_count = body.displayed_count   # ← how many rows frontend has already shown
+    displayed_count = body.displayed_count   # rows frontend has already shown
+    # FIX Bug 1: true total sent back by frontend on pagination calls so the
+    # footer always references the real total (28), not just the batch size (10).
+    client_total_rows = body.total_rows
+    # FIX Bug 2: frontend sets this when user says "show all remaining".
+    show_all = body.show_all
     now = datetime.now(timezone.utc)
     page_size = settings.PAGE_SIZE
 
@@ -175,6 +181,8 @@ async def run_query(
             f"[STREAM] intent={intent.value} | "
             f"context_turns={len(context)} | "
             f"displayed_count={displayed_count} | "
+            f"client_total_rows={client_total_rows} | "
+            f"show_all={show_all} | "
             f"question={question[:80]!r}"
         )
 
@@ -212,8 +220,6 @@ async def run_query(
             return
 
         # ── 3. Conversational (GREETING, CHAT, FAREWELL) ──────────────────────
-        # FIX: now uses _build_conversational_system_prompt() so the assistant
-        # responds in-character for this client deployment, not as a generic bot.
         if intent in {IntentType.GREETING, IntentType.CHAT, IntentType.FAREWELL}:
             system_prompt = _build_conversational_system_prompt()
             conversational_prompt = f"{system_prompt}\n\nUser: {question}"
@@ -282,17 +288,31 @@ async def run_query(
             })
             return
 
-        # ── 5. DB Query or Pagination — both go through service.run() ─────────
+        # ── 5. DB Query / Pagination / Show-all — all go through service.run() ─
         # For PAGINATION, displayed_count is the reliable source of truth for
         # the OFFSET. It comes from the frontend and is a plain integer — no
         # regex scraping of LLM answer text needed.
+        # For SHOW_ALL, show_all=True tells the service to drop the PAGE_SIZE cap.
         yield _sse({"status": "thinking", "done": False})
+
+        # FIX Bug 2: treat SHOW_ALL as a pagination call but with the cap removed.
+        effective_show_all = show_all or (intent == IntentType.SHOW_ALL)
+        effective_intent = (
+            IntentType.PAGINATION
+            if intent == IntentType.SHOW_ALL
+            else intent
+        )
 
         result = service.run(
             question,
             context=context,
-            intent=intent,
-            displayed_count=displayed_count,   # ← passed straight to prompt_builder
+            intent=effective_intent,
+            displayed_count=displayed_count,
+            # FIX Bug 1: pass the true total so prompt_builder can reference it
+            # in the footer even when the DB only returned a single page's rows.
+            known_total_rows=client_total_rows,
+            # FIX Bug 2: skip PAGE_SIZE cap — return all remaining rows at once.
+            show_all=effective_show_all,
         )
 
         if result.error:
@@ -312,15 +332,19 @@ async def run_query(
             return
 
         all_results = result.results
-        total_rows = result.row_count
-        first_page = all_results[:page_size]
+        # FIX Bug 1: use the true total, which the service now resolves correctly.
+        total_rows = result.total_rows
+        # For show_all, show every row returned; otherwise cap to page_size.
+        display_results = all_results if effective_show_all else all_results[:page_size]
 
         logger.info(
             f"[STREAM] Response ready | "
             f"total_rows={total_rows} | "
-            f"first_page={len(first_page)} | "
+            f"batch_rows={len(all_results)} | "
+            f"display_rows={len(display_results)} | "
+            f"show_all={effective_show_all} | "
             f"strategy={result.strategy_used} | "
-            f"intent={intent.value}"
+            f"intent={effective_intent.value}"
         )
 
         # Persist to in-memory history
@@ -377,9 +401,9 @@ async def run_query(
         yield _sse({
             "question": result.question,
             "sql": result.sql,
-            "results": first_page,
+            "results": display_results,
             "all_results": all_results,
-            "row_count": len(first_page),
+            "row_count": len(display_results),
             "total_rows": total_rows,
             "page_size": page_size,
             "strategy_used": result.strategy_used,

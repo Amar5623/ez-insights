@@ -12,6 +12,17 @@
  * the token is guaranteed to already be in localStorage (set during login/signup
  * and confirmed by the /api/auth/me check). This eliminates the "Not
  * authenticated" 401 on the very first fetchChats call.
+ *
+ * PAGINATION CHANGES
+ * ──────────────────
+ * FIX Bug 1: sendQuery now accepts `total_rows` in the body. On pagination
+ * calls chat-context passes the true total (received in the original query's
+ * done event) back to the backend. The backend uses it in the answer prompt so
+ * the footer always reads "Showing rows 11–20 of 28" instead of "20 of 20".
+ *
+ * FIX Bug 2: sendQuery now accepts `show_all` in the body. When the user says
+ * "show all remaining", chat-context sets show_all=true so the backend drops
+ * the PAGE_SIZE cap and returns every remaining row at once.
  */
 
 // ── Module-level state ─────────────────────────────────────────────────────────
@@ -88,12 +99,6 @@ export interface QueryResponse {
 
 // ── Generic authenticated proxy fetch ─────────────────────────────────────────
 
-/**
- * Wraps fetch() for all /api/proxy/* calls:
- *  - Injects Authorization: Bearer <token>
- *  - Translates 401 → "Not authenticated"
- *  - Translates 502 / network failure → "Backend unreachable"
- */
 export async function proxyFetch(path: string, options: RequestInit = {}): Promise<Response> {
   const token = getToken()
   if (!token) throw new Error('Not authenticated')
@@ -173,27 +178,35 @@ export async function updateChatTitle(
 /**
  * Streams a NL→SQL query via the backend SSE endpoint.
  *
- * CHANGE: body now accepts `displayed_count` — the number of rows the frontend
- * has already shown to the user. The backend uses this as the OFFSET when
- * generating the paginated SQL (LIMIT page_size OFFSET displayed_count).
- * On a fresh query this is 0 (default). On "Load more from DB" it equals
- * the number of rows currently displayed, so the backend fetches the next page.
- *
- * @param body     - { question, context?, displayed_count? }
+ * @param body     - { question, context?, displayed_count?, total_rows?, show_all? }
  * @param onChunk  - called for each word chunk as the answer streams in
  * @param onDone   - called once with the final metadata payload (done: true)
  * @param onError  - called if the stream yields an error event or throws
+ *
+ * FIX Bug 1: `total_rows` — the true total from the original query's done event.
+ *   Pass this on every pagination call so the backend can write an accurate footer.
+ *   Omit (or pass 0) on fresh queries.
+ *
+ * FIX Bug 2: `show_all` — set to true when the user says "show all remaining".
+ *   The backend will drop the PAGE_SIZE cap and return every remaining row at once.
  */
 export async function sendQuery(
   body: {
     question: string
     context?: Array<{ question: string; sql: string; answer: string }>
-    /**
-     * Rows the user has already seen. Drives LIMIT/OFFSET on the backend.
-     * Omit (or pass 0) for a fresh query; pass the current displayed row
-     * count when the user clicks "Load more from database".
-     */
+    /** Rows the user has already seen. Drives LIMIT/OFFSET on the backend. */
     displayed_count?: number
+    /**
+     * FIX Bug 1: The true total row count from the original query's done event.
+     * Send this on every pagination call so the backend footer stays accurate.
+     * Omit (or pass 0) for fresh queries.
+     */
+    total_rows?: number
+    /**
+     * FIX Bug 2: When true, the backend drops the PAGE_SIZE cap and returns
+     * every remaining row at once. Set when user says "show all remaining".
+     */
+    show_all?: boolean
   },
   onChunk: (chunk: string) => void,
   onDone: (meta: Partial<QueryResponse>) => void,
@@ -205,7 +218,6 @@ export async function sendQuery(
     'Content-Type': 'application/json',
   }
   if (token) headers['Authorization'] = `Bearer ${token}`
-  // Forward active chat context so the backend can persist messages
   if (_activeChatId) headers['X-Chat-Id'] = _activeChatId
   if (_activeUserId) headers['X-User-Id'] = _activeUserId
 
@@ -214,8 +226,6 @@ export async function sendQuery(
     res = await fetch('/api/proxy/query', {
       method: 'POST',
       headers,
-      // displayed_count is part of the body object — serialised automatically.
-      // Backend QueryRequest: { question, context, displayed_count }
       body: JSON.stringify(body),
     })
   } catch {
@@ -241,7 +251,6 @@ export async function sendQuery(
 
       buffer += decoder.decode(value, { stream: true })
 
-      // SSE lines are separated by \n\n; process complete messages only
       const parts = buffer.split('\n\n')
       buffer = parts.pop() ?? ''
 
@@ -265,8 +274,6 @@ export async function sendQuery(
           } else if (event.error && typeof event.error === 'string') {
             onError(event.error)
           }
-          // status: "thinking" events are intentionally ignored here —
-          // chat-context already shows the loading bubble while isSending=true
         }
       }
     }
