@@ -453,7 +453,7 @@ class QueryService:
         count = len(rows)
         if count == 0:
             return "empty"
-        if count <= self._settings.MAX_ROWS_FOR_LLM:
+        if count <= self._settings.PAGE_SIZE:
             return "small"
         return "large"
 

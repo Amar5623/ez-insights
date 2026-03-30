@@ -45,41 +45,31 @@ export interface HealthResponse {
 
 // ── Chat UI types ──────────────────────────────────────────────────────────────
 
+// lib/types.ts
+
+export interface User {
+  id: string
+  email: string
+  name?: string
+}
+
 export interface ChatMessage {
   id: string
   role: 'user' | 'assistant'
-  // The text content — streams in word by word for assistant messages
   content: string
-  // First page of results (shown immediately)
-  results?: Record<string, unknown>[]
-  // All rows — used for client-side "show more" pagination
-  all_results?: Record<string, unknown>[]
-  // How many rows to show right now (incremented by "show more" clicks)
-  displayed_rows?: number
-  // Total rows the DB returned
-  total_rows?: number
-  // Page size setting from backend
-  page_size?: number
+  isLoading?: boolean
   sql?: string
-  row_count?: number
   strategy_used?: string
   timestamp: Date
-  isLoading?: boolean
-  isStreaming?: boolean
+  row_count?: number
 }
 
 export interface Chat {
   id: string
   title: string
   messages: ChatMessage[]
-  created_at: Date
-  updated_at: Date
-}
-
-export interface User {
-  id: string
-  email: string
-  name: string
+  created_at?: string
+  updated_at?: string
 }
 
 export type LoadingState = 'idle' | 'loading' | 'error'

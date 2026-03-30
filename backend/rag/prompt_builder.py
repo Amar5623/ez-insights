@@ -23,6 +23,17 @@ KEY DESIGN DECISIONS:
 4. Retry context (attempt_history) is injected into the user message so the LLM
    can see exactly what it tried and what error it got. The schema chunks are also
    present in the retry prompt so the LLM can look up the correct column name.
+
+ANSWER FORMAT CONTRACT (enforced via _QUALITY_INSTRUCTIONS):
+   Every non-empty DB response must follow this exact 3-part structure:
+     1. One or two sentences introducing the result
+        e.g. "Here are the top 10 customers by revenue:"
+     2. A markdown table of exactly PAGE_SIZE rows (or all rows if fewer)
+     3. A single footer line if more rows exist:
+        "_Showing {page_size} of {total_rows} total rows.
+         Say **show more** to see the next {page_size}._"
+   This keeps the chat clean: the LLM streams the full formatted response
+   and the user types "show more" to paginate — no separate UI widget needed.
 """
 
 import json
@@ -118,40 +129,84 @@ _ANSWER_USER_TEMPLATE = """## Conversation Context
 
 
 # ── Quality instructions ──────────────────────────────────────────────────────
-# These tell the answer LLM exactly how to format its response based on
-# how many rows came back and whether this is a pagination turn.
+# These enforce the 3-part answer format:
+#   Part 1 — 1-2 sentence intro  ("Here are the top customers you asked for:")
+#   Part 2 — markdown table      (capped at PAGE_SIZE rows)
+#   Part 3 — footer line         ("Showing 10 of 47 total rows. Say show more...")
+#
+# IMPORTANT PLACEHOLDERS:
+#   {total_rows} — total rows returned by the DB for this query
+#   {page_size}  — rows per page from settings (what the user sees at a time)
+#   {offset_start} / {offset_end} — row range for pagination turns
+#
+# Any instruction containing those placeholders is automatically formatted by
+# build_answer_prompt() before being sent to the LLM.
 
 _QUALITY_INSTRUCTIONS: dict[str, str] = {
+
+    # ── All results fit in one page ──────────────────────────────────────────
+    # Row count ≤ PAGE_SIZE: show everything, no footer needed.
     "small": (
-        "Write a clear, concise natural language answer based on the data above. "
-        "Be specific — mention actual values from the results. "
-        "Format the data as a markdown table if there are 3+ columns or 3+ rows."
+        "Structure your response in exactly two parts:\n"
+        "1. ONE sentence introducing what the data shows "
+        "(e.g. 'Here are the customer details you requested:' "
+        "or 'I found {total_rows} matching record(s):'). "
+        "Do not repeat the user's question verbatim.\n"
+        "2. Present ALL {total_rows} rows as a markdown table. "
+        "If there is only one row or the result is a single value, "
+        "use a short natural-language sentence instead of a table.\n"
+        "Do NOT add any footer or 'show more' line — "
+        "all {total_rows} result(s) are shown above."
     ),
+
+    # ── More rows than one page ──────────────────────────────────────────────
+    # Row count > PAGE_SIZE: show first PAGE_SIZE rows and prompt for more.
     "large": (
-        "The query returned {total_rows} rows total. "
-        "Show the first {page_size} rows as a markdown table. "
-        "End with exactly this line (fill in the numbers): "
-        "'_Showing 1–{page_size} of {total_rows} results. "
-        "Say **show more** to see the next {page_size}._'"
+        "Structure your response in exactly three parts:\n"
+        "1. ONE sentence introducing what the data shows "
+        "(e.g. 'Here are the first {page_size} of {total_rows} results:' "
+        "or 'Here are the top {page_size} customers by revenue:'). "
+        "Do not repeat the user's question verbatim.\n"
+        "2. A markdown table containing EXACTLY the first {page_size} rows "
+        "from the results above — no more, no fewer. "
+        "Do NOT include rows beyond position {page_size}.\n"
+        "3. End your response with EXACTLY this line and nothing after it "
+        "(substitute the numbers, keep the italics and bold):\n"
+        "_Showing {page_size} of {total_rows} total rows. "
+        "Say **show more** to see the next {page_size}._"
     ),
+
+    # ── User asked for the next page ─────────────────────────────────────────
     "pagination": (
-        "The user asked for the next page of results. "
-        "These are rows {offset_start}–{offset_end} of {total_rows} total. "
-        "Present them as a markdown table. "
-        "If there are still more rows after this page, end with exactly: "
-        "'_Showing rows {offset_start}–{offset_end} of {total_rows}. "
-        "Say **show more** for the next page._' "
-        "If this is the last page (offset_end >= total_rows), end with: "
-        "'_You have now seen all {total_rows} results._'"
+        "Structure your response in exactly three parts:\n"
+        "1. ONE sentence confirming which page this is "
+        "(e.g. 'Here are rows {offset_start}–{offset_end} of {total_rows}:'). "
+        "Do not repeat the user's question verbatim.\n"
+        "2. Present the rows as a markdown table.\n"
+        "3. If more rows remain after this page ({offset_end} < {total_rows}), "
+        "end with EXACTLY:\n"
+        "_Showing rows {offset_start}–{offset_end} of {total_rows}. "
+        "Say **show more** for the next page._\n"
+        "If this is the last page ({offset_end} >= {total_rows}), "
+        "end with EXACTLY:\n"
+        "_You have now seen all {total_rows} results._"
     ),
+
+    # ── No rows returned ─────────────────────────────────────────────────────
     "empty": (
-        "No results were returned. Tell the user clearly that nothing was found. "
-        "Suggest likely reasons and offer a concrete rephrased question they could try."
+        "Tell the user in one sentence that no results were found. "
+        "Then in a second sentence suggest the most likely reason "
+        "(wrong filter, no data for that period, typo in a name, etc.) "
+        "and offer one concrete rephrased question they could try."
     ),
+
+    # ── Rows returned but all values are null/empty ──────────────────────────
     "all_null": (
         "The query returned rows but all values appear empty or null. "
         "Tell the user the data appears to be missing or not yet populated."
     ),
+
+    # ── Results may not answer the question well ─────────────────────────────
     "low_relevance": (
         "These results may not fully answer the question. Be honest about what "
         "was returned and suggest how to rephrase for a better result."
@@ -298,8 +353,14 @@ class PromptBuilder:
         max_for_llm = settings.MAX_ROWS_FOR_LLM
         page_size = settings.PAGE_SIZE
 
-        # Limit rows sent to LLM — the full result set can be huge
-        preview_rows = rows[:max_for_llm]
+        # For the "large" quality path, only send PAGE_SIZE rows to the LLM —
+        # sending more would let the LLM accidentally include extra rows in the
+        # markdown table despite the instruction to cap at page_size.
+        # For "small", send all rows (they all fit in one page by definition).
+        if quality == "large":
+            preview_rows = rows[:page_size]
+        else:
+            preview_rows = rows[:max_for_llm]
 
         # Strip embedding columns — they are float arrays, useless in prompts
         cleaned = [
@@ -312,9 +373,9 @@ class PromptBuilder:
         except Exception:
             results_preview = "\n".join(str(row) for row in cleaned)
 
-        if row_count > max_for_llm:
+        if row_count > len(preview_rows):
             results_preview += (
-                f"\n\n(Showing {max_for_llm} of {row_count} total rows in this prompt.)"
+                f"\n\n(Showing {len(preview_rows)} of {row_count} total rows in this prompt.)"
             )
 
         # Resolve quality instruction, substituting numeric placeholders
@@ -322,7 +383,10 @@ class PromptBuilder:
 
         offset_end = pagination_offset + len(preview_rows)
 
-        if any(ph in raw_instruction for ph in ("{total_rows}", "{page_size}", "{offset_start}", "{offset_end}")):
+        if any(
+            ph in raw_instruction
+            for ph in ("{total_rows}", "{page_size}", "{offset_start}", "{offset_end}")
+        ):
             quality_instruction = raw_instruction.format(
                 total_rows=row_count,
                 page_size=page_size,
@@ -404,40 +468,27 @@ class PromptBuilder:
         """
         Format prior turns for the answer generation prompt.
 
-        Includes Q, SQL, and a truncated answer so the LLM can reference
-        prior results without repeating them.
+        Includes question + answer (not SQL) so the LLM can write a
+        contextually relevant follow-up answer.
         """
         if not context:
-            return "(No prior conversation turns)"
+            return "(No prior conversation)"
 
-        lines = [
-            "Previous conversation turns "
-            "(for context only — do not repeat these answers):"
-        ]
-        for i, turn in enumerate(context[-5:], 1):
+        lines = []
+        for i, turn in enumerate(context[-3:], 1):
             q = turn.get("question", "").strip()
-            sql = turn.get("sql", "").strip()
-            answer = turn.get("answer", "").strip()
-            if len(answer) > 120:
-                answer = answer[:120] + "..."
-            lines.append(f"  Turn {i}:")
+            a = turn.get("answer", "").strip()
             if q:
-                lines.append(f"    Q: {q}")
-            if sql:
-                lines.append(f"    SQL: {sql}")
-            if answer:
-                lines.append(f"    A: {answer}")
+                lines.append(f"Turn {i} — User: {q}")
+            if a:
+                # Truncate long answers to avoid bloating the prompt
+                truncated = a[:300] + "…" if len(a) > 300 else a
+                lines.append(f"Turn {i} — Assistant: {truncated}")
 
         return "\n".join(lines)
 
     def _get_last_sql(self, context: list[dict]) -> str | None:
-        """
-        Return the most recent non-empty SQL from conversation context.
-
-        Iterates newest-first so the most recent query is always used.
-        Returns None if no SQL has been executed yet in this session
-        (caller falls back to normal SQL generation prompt).
-        """
+        """Return the most recent SQL from the conversation context."""
         for turn in reversed(context):
             sql = turn.get("sql", "").strip()
             if sql:

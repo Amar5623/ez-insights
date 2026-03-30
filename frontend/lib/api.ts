@@ -173,7 +173,13 @@ export async function updateChatTitle(
 /**
  * Streams a NL→SQL query via the backend SSE endpoint.
  *
- * @param body     - { question, context? }
+ * CHANGE: body now accepts `displayed_count` — the number of rows the frontend
+ * has already shown to the user. The backend uses this as the OFFSET when
+ * generating the paginated SQL (LIMIT page_size OFFSET displayed_count).
+ * On a fresh query this is 0 (default). On "Load more from DB" it equals
+ * the number of rows currently displayed, so the backend fetches the next page.
+ *
+ * @param body     - { question, context?, displayed_count? }
  * @param onChunk  - called for each word chunk as the answer streams in
  * @param onDone   - called once with the final metadata payload (done: true)
  * @param onError  - called if the stream yields an error event or throws
@@ -182,6 +188,12 @@ export async function sendQuery(
   body: {
     question: string
     context?: Array<{ question: string; sql: string; answer: string }>
+    /**
+     * Rows the user has already seen. Drives LIMIT/OFFSET on the backend.
+     * Omit (or pass 0) for a fresh query; pass the current displayed row
+     * count when the user clicks "Load more from database".
+     */
+    displayed_count?: number
   },
   onChunk: (chunk: string) => void,
   onDone: (meta: Partial<QueryResponse>) => void,
@@ -202,6 +214,8 @@ export async function sendQuery(
     res = await fetch('/api/proxy/query', {
       method: 'POST',
       headers,
+      // displayed_count is part of the body object — serialised automatically.
+      // Backend QueryRequest: { question, context, displayed_count }
       body: JSON.stringify(body),
     })
   } catch {
