@@ -197,7 +197,7 @@ def _yaml_to_markdown(db_context: dict) -> str:
     lines = [f"## DATABASE: {db_context.get('database_name', 'unknown')}", ""]
 
     # Safe views
-    views = db_context.get("safe_views", {})
+    views = db_context.get("views", {})
     if views:
         lines.append("### Safe Views (use by default)")
         for view_name, view_info in views.items():

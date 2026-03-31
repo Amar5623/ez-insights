@@ -40,9 +40,9 @@
 database_name: classicmodels
 database_type: mysql
 
-# ─── Safe Views ───────────────────────────────────────────────────────────────
+# ─── Views ───────────────────────────────────────────────────────────────
 # Use these instead of raw tables when PII is a concern.
-safe_views:
+views:
   vw_customers:
     replaces: customers
     excludes_columns: [cvv, card_number, card_expiry, upi_id, account_number, ifsc_code, creditLimit]
