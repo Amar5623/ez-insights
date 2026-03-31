@@ -318,6 +318,27 @@ class QueryService:
             f"resolved_total={true_total} | is_pagination={is_pagination}"
         )
 
+        # ── 4a. Short-circuit — user asked for more but everything already shown ─
+        # Do this in code, not in the LLM prompt — the LLM has no reliable way
+        # to know pagination state from the prompt alone.
+        if is_pagination and true_total > 0 and pagination_offset >= true_total:
+            logger.info(
+                f"[PIPELINE] All rows already seen | "
+                f"pagination_offset={pagination_offset} >= true_total={true_total}"
+            )
+            return QueryResponse(
+                question=question,
+                sql=strategy_result.query_used,
+                results=[],
+                all_results=[],
+                row_count=0,
+                total_rows=true_total,
+                page_size=self._settings.PAGE_SIZE,
+                strategy_used=strategy_result.strategy_name,
+                answer="You have now seen all results of your previous query. How else can I help you?",
+                error=None,
+            )
+
         # ── 5. Assess result quality ──────────────────────────────────────────
         if show_all and is_pagination:
             # All remaining rows at once — use dedicated quality instruction.
