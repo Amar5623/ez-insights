@@ -5,7 +5,6 @@ import { useChat } from '@/lib/chat-context'
 import type { ChatMessage } from '@/lib/types'
 import { cn } from '@/lib/utils'
 import { Badge } from '@/components/ui/badge'
-import { Skeleton } from '@/components/ui/skeleton'
 import {
   Collapsible,
   CollapsibleContent,
@@ -137,26 +136,21 @@ function MarkdownAnswer({ content }: { content: string }) {
 }
 
 // ── LoadingBubble ──────────────────────────────────────────────────────────────
-function LoadingBubble() {
+function ThinkingBubble() {
   return (
     <div className="flex gap-3 animate-fade-in">
       <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-primary/20 to-primary/10 ring-2 ring-primary/20">
         <BotIcon className="h-4 w-4 text-primary animate-pulse-subtle" />
       </div>
-      <div className="flex-1 space-y-3 py-1">
-        <div className="flex items-center gap-2">
-          <div className="h-4 w-4 rounded-full bg-primary/20 animate-bounce-subtle" />
-          <div className="h-4 w-4 rounded-full bg-primary/30 animate-bounce-subtle animation-delay-100" />
-          <div className="h-4 w-4 rounded-full bg-primary/40 animate-bounce-subtle animation-delay-200" />
-        </div>
-        <Skeleton className="h-4 w-3/4 animate-shimmer" />
-        <Skeleton className="h-4 w-1/2 animate-shimmer animation-delay-100" />
+      <div className="flex items-center gap-1.5 py-3">
+        <div className="h-2 w-2 rounded-full bg-primary/40 animate-bounce-subtle" />
+        <div className="h-2 w-2 rounded-full bg-primary/60 animate-bounce-subtle animation-delay-100" />
+        <div className="h-2 w-2 rounded-full bg-primary/80 animate-bounce-subtle animation-delay-200" />
       </div>
     </div>
   )
 }
-
-// ── MessageBubble ──────────────────────────────────────────────────────────────
+//── MessageBubble ──────────────────────────────────────────────────────────────
 function MessageBubble({
   message,
   index,
@@ -165,10 +159,11 @@ function MessageBubble({
   index: number
 }) {
   const isUser = message.role === 'user'
+  const isStreaming = !isUser && message.isLoading && !!message.content
 
-  // Show loading bubble only when isLoading AND no content yet
-  if (message.isLoading && !message.content) {
-    return <LoadingBubble />
+  // Only show thinking dots when waiting for the FIRST token
+  if (!isUser && message.isLoading && !message.content) {
+    return <ThinkingBubble />
   }
 
   return (
@@ -218,12 +213,20 @@ function MessageBubble({
               {message.content}
             </p>
           ) : (
-            <MarkdownAnswer content={message.content} />
+            <div className="relative">
+              <MarkdownAnswer content={message.content} />
+              {isStreaming && (
+                <span
+                  className="inline-block w-[2px] h-[1em] bg-primary align-middle ml-0.5 animate-pulse"
+                  aria-hidden="true"
+                />
+              )}
+            </div>
           )}
         </div>
 
-        {/* SQL Preview */}
-        {message.sql && (
+        {/* SQL Preview — only after streaming is done */}
+        {!isStreaming && message.sql && (
           <Collapsible className="w-full animate-scale-in">
             <CollapsibleTrigger className="flex items-center gap-2 rounded-lg px-3 py-1.5 text-xs text-muted-foreground transition-all duration-200 hover:bg-muted hover:text-foreground">
               <CodeIcon className="h-3.5 w-3.5" />
@@ -238,8 +241,8 @@ function MessageBubble({
           </Collapsible>
         )}
 
-        {/* Strategy Badge */}
-        {message.strategy_used && (
+        {/* Strategy Badge — only after streaming is done */}
+        {!isStreaming && message.strategy_used && (
           <Badge
             variant="secondary"
             className="text-xs gap-1 animate-scale-in animation-delay-200"

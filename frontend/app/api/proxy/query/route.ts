@@ -22,7 +22,8 @@
  */
 
 import { NextRequest } from 'next/server'
-import { cookies } from 'next/headers'
+
+export const dynamic = 'force-dynamic'
 
 const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:8000'
 const BACKEND_API_KEY = process.env.BACKEND_API_KEY || ''
@@ -73,9 +74,11 @@ export async function POST(req: NextRequest) {
     status: 200,
     headers: {
       'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
+      'Cache-Control': 'no-cache, no-transform',
       'Connection': 'keep-alive',
+      'Transfer-Encoding': 'chunked',
       'X-Accel-Buffering': 'no',
+      'X-Content-Type-Options': 'nosniff',
     },
   })
 }
