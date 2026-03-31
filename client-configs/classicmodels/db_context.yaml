@@ -40,7 +40,7 @@
 database_name: classicmodels
 database_type: mysql
 
-# ─── Safe Views ───────────────────────────────────────────────────────────────
+# ─── Views ───────────────────────────────────────────────────────────────
 # Use these instead of raw tables when PII is a concern.
 views:
   vw_customers:

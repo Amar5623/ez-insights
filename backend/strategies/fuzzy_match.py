@@ -256,13 +256,14 @@ class FuzzyMatchStrategy(BaseStrategy):
                 f"[MySQL] FuzzyMatchStrategy could not extract a search term from: {sql}"
             )
 
-        # ── 4. Determine table name ──────────────────────────────────────────
-        table_name = self._extract_table_name(sql)
+         # ── 4. Determine table name — resolve via alias map so that
+        #       joined columns (e.g. c.customerName → customers) are
+        #       looked up in the correct table, not the primary FROM table.
+        table_name = self._resolve_column_table(sql, column_name or "")
         if not table_name:
             raise ValueError(
                 f"[MySQL] FuzzyMatchStrategy could not determine table name from: {sql}"
             )
-
         # ── 5. Fetch all candidate values from DB ────────────────────────────
         # If column_name was not found in WHERE clause, infer from schema
         if not column_name:
@@ -361,17 +362,17 @@ class FuzzyMatchStrategy(BaseStrategy):
         # Pattern: column = 'value'  or  column LIKE '%value%'
         # Also handles LOWER(column) = 'value'
         patterns = [
-            # LOWER(column) = 'value'
-            r"LOWER\s*\(\s*(\w+)\s*\)\s*(?:=|LIKE)\s*'%?([^'%]+)%?'",
-            # column = 'value'  or  column LIKE '%value%'
-            r"\b(\w+)\s+(?:=|LIKE)\s+'%?([^'%]+)%?'",
+            # LOWER(column) = 'value' (handles '' escaped quotes inside value)
+            r"LOWER\s*\(\s*(\w+)\s*\)\s*(?:=|LIKE)\s*'%?((?:[^'%]|'')+)%?'",
+            # column = 'value'  or  column LIKE '%value%' (handles '' escaped quotes)
+            r"\b(\w+)\s+(?:=|LIKE)\s+'%?((?:[^'%]|'')+)%?'",
         ]
 
         for pattern in patterns:
             match = re.search(pattern, sql, re.IGNORECASE)
             if match:
                 column_name = match.group(1).lower()
-                search_term = match.group(2).strip()
+                search_term = match.group(2).strip().replace("''", "'")
                 return search_term, column_name
 
         # Fallback — extract any single-quoted string as the search term
@@ -396,6 +397,53 @@ class FuzzyMatchStrategy(BaseStrategy):
             re.IGNORECASE,
         )
         return match.group(1) if match else None
+
+    def _build_alias_map(self, sql: str) -> dict[str, str]:
+        """
+        MYSQL-SPECIFIC: Build a mapping of alias -> real table name from
+        all FROM and JOIN clauses in the SQL.
+
+        Example:
+            FROM orders o JOIN customers c  ->  {"o": "orders", "c": "customers"}
+        """
+        alias_map: dict[str, str] = {}
+        pattern = re.compile(
+            r"\b(?:FROM|JOIN)\s+`?(\w+)`?\s+(?:AS\s+)?(\w+)",
+            re.IGNORECASE,
+        )
+        for match in pattern.finditer(sql):
+            table, alias = match.group(1), match.group(2)
+            # Ignore SQL keywords accidentally captured as aliases
+            if alias.upper() not in ("WHERE", "ON", "SET", "JOIN", "LEFT",
+                                    "RIGHT", "INNER", "OUTER", "ORDER",
+                                    "GROUP", "HAVING", "LIMIT"):
+                alias_map[alias] = table
+        return alias_map
+
+    def _resolve_column_table(self, sql: str, column_name: str) -> str | None:
+        """
+        MYSQL-SPECIFIC: Find which real table owns `column_name` by inspecting
+        the WHERE clause for a qualified reference like `c.customerName`,
+        then resolving the alias via _build_alias_map.
+
+        Falls back to the primary FROM table if no qualified reference found.
+        """
+        alias_map = self._build_alias_map(sql)
+
+        # Look for alias.column in WHERE clause e.g. c.customerName
+        pattern = re.compile(
+            rf"\b(\w+)\.`?{re.escape(column_name)}`?",
+            re.IGNORECASE,
+        )
+        match = pattern.search(sql)
+        if match:
+            alias = match.group(1)
+            if alias in alias_map:
+                return alias_map[alias]
+
+        # Fallback — primary FROM table
+        return self._extract_table_name(sql)
+
 
     def _infer_text_column(self, table_name: str) -> str | None:
         """
