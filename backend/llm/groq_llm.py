@@ -73,7 +73,7 @@ class GroqLLM(BaseLLM):
             model=self.model,
             messages=messages,
             temperature=kwargs.get("temperature", 0.1),
-            max_tokens=kwargs.get("max_tokens", 1024),
+            max_tokens=kwargs.get("max_tokens", 8048),
         )
         content = response.choices[0].message.content
         return content.strip() if content else ""
