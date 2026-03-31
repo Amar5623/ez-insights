@@ -164,8 +164,8 @@ _QUALITY_INSTRUCTIONS: dict[str, str] = {
         "Do NOT include rows beyond position {page_size}.\n"
         "3. End your response with EXACTLY this line and nothing after it "
         "(substitute the numbers, keep the italics and bold):\n"
-        "_Showing {page_size} of {total_rows} total rows. "
-        "Say **show more** to see the next {page_size}._"
+        "Showing {page_size} of {total_rows} total rows. "
+        "Say **show more** to see the next {page_size}."
     ),
 
     # ── User asked for the next page ─────────────────────────────────────────
@@ -176,7 +176,7 @@ _QUALITY_INSTRUCTIONS: dict[str, str] = {
 
         "FIRST — detect if the user is requesting more results AFTER all rows have already been shown.\n"
         "If ALL results have already been displayed previously, respond with EXACTLY:\n"
-        "_You have now seen all results of your previous query. How else can I help you?_\n"
+        "You have now seen all results of your previous query. How else can I help you?\n"
         "Do NOT follow any further structure.\n\n"
 
         "SECOND — otherwise, format the current page strictly using the rules below.\n\n"
@@ -199,10 +199,10 @@ _QUALITY_INSTRUCTIONS: dict[str, str] = {
 
         "3. Closing line:\n"
         "- If MORE rows remain ({offset_end} < {total_rows}), end with EXACTLY:\n"
-        "_Showing rows {offset_start}–{offset_end} of {total_rows}. Say **show more** for the next page._\n\n"
+        "Showing rows {offset_start}–{offset_end} of {total_rows}. Say **show more** for the next page.\n\n"
 
         "- If this is the LAST page ({offset_end} >= {total_rows}), end with EXACTLY:\n"
-        "_You have now seen all {total_rows} results. How else can I help you?_\n\n"
+        "You have now seen all {total_rows} results. How else can I help you?\n\n"
 
         "STRICT RULES:\n"
         "- Never mix both endings\n"
@@ -222,7 +222,7 @@ _QUALITY_INSTRUCTIONS: dict[str, str] = {
         "Do not repeat the user's question verbatim.\n"
         "2. Present ALL {batch_rows} rows as a markdown table.\n"
         "End with EXACTLY this line and nothing after it:\n"
-        "_You have now seen all {total_rows} results._"
+        "You have now seen all {total_rows} results."
     ),
 
     # ── No rows returned ─────────────────────────────────────────────────────

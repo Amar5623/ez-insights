@@ -79,6 +79,37 @@ class QueryResponse:
 _SPECIAL_SIGNALS = ("__OUT_OF_SCOPE__", "__PRIVACY_BLOCK__", "__CLARIFY__")
 
 
+def _extract_friendly_message(signal_text: str) -> str:
+    """
+    Parse the LLM's special signal output into a user-facing message.
+
+    The LLM emits one of:
+        __OUT_OF_SCOPE__
+        REASON: <why it can't answer>
+        SUGGEST: <what the user could ask instead>
+
+    We prefer the SUGGEST line. Fall back to REASON. Fall back to a
+    generic message if neither is present.
+    """
+    suggest = ""
+    reason = ""
+    for line in signal_text.splitlines():
+        line = line.strip()
+        if line.startswith("SUGGEST:"):
+            suggest = line[len("SUGGEST:"):].strip()
+        elif line.startswith("REASON:"):
+            reason = line[len("REASON:"):].strip()
+
+    if suggest:
+        return f"I can't answer that directly. {suggest}"
+    if reason:
+        return f"I can't answer that: {reason}"
+    return (
+        "I couldn't find an answer for that in the database. "
+        "Try asking something specific, like 'What are the top-selling products?' "
+        "or 'What is the total revenue this month?'"
+    )
+
 # ─── Service ──────────────────────────────────────────────────────────────────
 
 class QueryService:
@@ -171,19 +202,19 @@ class QueryService:
                 f"[PIPELINE] FAILED — MaxRetriesExceeded | "
                 f"total_latency={total_ms}ms | error={e}"
             )
+            # Extract a friendly user-facing message from the signal if present.
+            # The LLM emits: __OUT_OF_SCOPE__\nREASON: ...\nSUGGEST: <message>
+            friendly_answer = _extract_friendly_message(str(e))
             return QueryResponse(
                 question=question,
                 sql="",
                 results=[],
                 row_count=0,
                 strategy_used=self.strategy.strategy_name,
-                answer="",
-                error=(
-                    f"Could not generate a valid query after "
-                    f"{self._settings.MAX_RETRIES} attempts. "
-                    f"Try rephrasing your question. Detail: {e}"
-                ),
+                answer=friendly_answer,
+                error=None,   # Don't surface a raw error — we have a friendly answer
             )
+        
         except Exception as exc:
             total_ms = int((time.perf_counter() - pipeline_start) * 1000)
             logger.error(

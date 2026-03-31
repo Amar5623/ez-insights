@@ -338,18 +338,40 @@ async def run_query(
 
         if result.error:
             logger.error(f"[STREAM] Pipeline error: {result.error}")
-            yield _sse({
-                "question": question,
-                "sql": "",
-                "results": [],
-                "all_results": [],
-                "row_count": 0,
-                "total_rows": 0,
-                "page_size": page_size,
-                "strategy_used": result.strategy_used,
-                "error": result.error,
-                "done": True,
-            })
+            # If there's a friendly answer alongside the error, stream it like
+            # a normal response so the user sees it word-by-word, not as a raw
+            # error dump. This handles __OUT_OF_SCOPE__ / __PRIVACY_BLOCK__ signals.
+            if result.answer:
+                words = result.answer.split(" ")
+                for i, word in enumerate(words):
+                    chunk = word if i == 0 else " " + word
+                    yield _sse({"chunk": chunk, "done": False})
+                    await asyncio.sleep(0.02)
+                yield _sse({
+                    "question": question,
+                    "sql": "",
+                    "results": [],
+                    "all_results": [],
+                    "row_count": 0,
+                    "total_rows": 0,
+                    "page_size": page_size,
+                    "strategy_used": result.strategy_used,
+                    "error": None,
+                    "done": True,
+                })
+            else:
+                yield _sse({
+                    "question": question,
+                    "sql": "",
+                    "results": [],
+                    "all_results": [],
+                    "row_count": 0,
+                    "total_rows": 0,
+                    "page_size": page_size,
+                    "strategy_used": result.strategy_used,
+                    "error": result.error,
+                    "done": True,
+                })
             return
 
         all_results = result.results
