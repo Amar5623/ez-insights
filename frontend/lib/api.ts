@@ -260,7 +260,7 @@ export async function sendQuery(
       if (event.done === true) {
         onDone(event as Partial<QueryResponse>)
       } else if (typeof event.chunk === 'string') {
-        await new Promise(resolve => setTimeout(resolve, 20))
+        // await new Promise(resolve => setTimeout(resolve, 20))
         onChunk(event.chunk)
       } else if (event.error && typeof event.error === 'string') {
         onError(event.error)

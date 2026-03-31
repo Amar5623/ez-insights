@@ -155,6 +155,8 @@ class Settings(BaseSettings):
     # Example: CLIENT_CONFIG_PATH=./client-configs/classicmodels
     CLIENT_CONFIG_PATH: str = "./client-configs/classicmodels"
  
+    RATE_LIMIT_REQUESTS: int = 30   # max requests per window per IP
+    RATE_LIMIT_WINDOW_S: int = 60   # window size in seconds
       
     class Config:
         env_file = ".env"

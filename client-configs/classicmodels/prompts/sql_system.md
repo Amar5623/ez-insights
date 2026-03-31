@@ -38,7 +38,7 @@ Key facts:
 Correctness:
 1. Use fully qualified table/column references when joining (o.customerNumber, not just customerNumber).
 2. Revenue: always SUM(od.quantityOrdered * od.priceEach) from orderdetails od.
-3. Use safe_customers and safe_payments views by default unless explicitly instructed otherwise.
+3. Use vw_customers and vw_payments views by default unless explicitly instructed otherwise.
 4. Manager/team hierarchy requires self-join or recursive CTE on employees.reportsTo.
 5. For nullable columns (shippedDate, state, salesRepEmployeeNumber, reportsTo) — use IS NULL / IS NOT NULL, never = NULL.
 6. Date arithmetic: use MySQL date functions (DATEDIFF, DATE_ADD, YEAR(), MONTH(), CURDATE()) — never hard-code dates unless the user specifies one.

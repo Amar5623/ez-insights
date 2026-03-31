@@ -78,28 +78,45 @@ class QueryResponse:
 
 _SPECIAL_SIGNALS = ("__OUT_OF_SCOPE__", "__PRIVACY_BLOCK__", "__CLARIFY__")
 
-
 def _extract_friendly_message(signal_text: str) -> str:
     """
     Parse the LLM's special signal output into a user-facing message.
-
-    The LLM emits one of:
-        __OUT_OF_SCOPE__
-        REASON: <why it can't answer>
-        SUGGEST: <what the user could ask instead>
-
-    We prefer the SUGGEST line. Fall back to REASON. Fall back to a
-    generic message if neither is present.
+    Handles __OUT_OF_SCOPE__, __PRIVACY_BLOCK__, and __CLARIFY__.
     """
+    lines = signal_text.splitlines()
+    
+    # Detect signal type from first line
+    first = lines[0].strip() if lines else ""
+    
     suggest = ""
     reason = ""
-    for line in signal_text.splitlines():
+    ambiguity = ""
+    options: list[str] = []
+    
+    for line in lines[1:]:
         line = line.strip()
         if line.startswith("SUGGEST:"):
             suggest = line[len("SUGGEST:"):].strip()
         elif line.startswith("REASON:"):
             reason = line[len("REASON:"):].strip()
+        elif line.startswith("AMBIGUITY:"):
+            ambiguity = line[len("AMBIGUITY:"):].strip()
+        elif line.startswith("- ") and "CLARIFY" in first:
+            options.append(line[2:].strip())
 
+    if "__CLARIFY__" in first:
+        msg = f"I need a bit more clarity to answer that."
+        if ambiguity:
+            msg += f" {ambiguity}"
+        if options:
+            msg += "\n\nDid you mean:\n" + "\n".join(f"- {o}" for o in options)
+        return msg
+
+    if "__PRIVACY_BLOCK__" in first:
+        base = "That information is protected and can't be retrieved."
+        return f"{base} {reason}" if reason else base
+
+    # __OUT_OF_SCOPE__ (default)
     if suggest:
         return f"I can't answer that directly. {suggest}"
     if reason:
@@ -478,7 +495,7 @@ class QueryService:
                         error=str(exc),
                     ))
                     continue
-
+                
         # All attempts exhausted
         last_signal = str(last_exc) if last_exc else "unknown error"
         # If the last failure was a special signal, return it as the answer

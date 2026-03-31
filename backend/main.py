@@ -19,6 +19,7 @@ from api.middleware.auth import AuthMiddleware
 from api.middleware.logging import LoggingMiddleware
 from core.logging_config import setup_logging, get_logger
 from core.client_config import get_client_config
+from api.middleware.rate_limit import RateLimitMiddleware
 
 # Global service instance — created once at startup
 _query_service: QueryService | None = None
@@ -79,6 +80,7 @@ app = FastAPI(
 
 # Middleware
 app.add_middleware(LoggingMiddleware)
+app.add_middleware(RateLimitMiddleware)
 app.add_middleware(AuthMiddleware)
 app.add_middleware(
     CORSMiddleware,

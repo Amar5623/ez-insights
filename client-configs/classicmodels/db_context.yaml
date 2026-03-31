@@ -42,7 +42,7 @@ database_type: mysql
 
 # ─── Safe Views ───────────────────────────────────────────────────────────────
 # Use these instead of raw tables when PII is a concern.
-safe_views:
+views:
   vw_customers:
     replaces: customers
     excludes_columns: [cvv, card_number, card_expiry, upi_id, account_number, ifsc_code, creditLimit]
@@ -74,7 +74,7 @@ tables:
         description: "Approved credit ceiling in USD. Sensitive — excluded from vw_customers view."
       payment_method:
         description: "Primary payment method used by this customer."
-        valid_values: ["UPI", "NEFT", "CHECK"]
+        valid_values: ["UPI", "NEFT", "CHECK", "CARD"]
       country:
         description: "Country of the customer's business."
       state:

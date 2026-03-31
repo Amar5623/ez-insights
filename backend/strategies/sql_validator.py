@@ -206,18 +206,25 @@ class MySQLValidator(BaseQueryValidator):
 
         # ── 2. Must start with SELECT ────────────────────────────────────────
         # Strip leading comments before checking the first keyword.
+        # ── 2. Must start with SELECT or WITH (CTE) ──────────────────────────────
         sql_no_lead_comment = re.sub(
-            r"^(\s*(--[^\n]*\n|/\*.*?\*/)\s*)+", "", sql, flags=re.DOTALL
+            r"^(\s*(--[^\n]*\n|/\*.*?\*/)\\s*)+", "", sql, flags=re.DOTALL
         ).strip()
 
         first_keyword = sql_no_lead_comment.split()[0].upper() if sql_no_lead_comment else ""
-        if first_keyword != "SELECT":
+
+        # WITH starts a Common Table Expression — always followed by SELECT, read-only safe.
+        if first_keyword not in ("SELECT", "WITH"):
             return (
                 False,
                 f"Only SELECT statements are permitted. "
                 f"Query starts with '{first_keyword}'.",
             )
 
+        # If it starts with WITH, verify it contains a SELECT and no dangerous DML
+        if first_keyword == "WITH":
+            if not re.search(r"\bSELECT\b", sql, re.IGNORECASE):
+                return False, "WITH clause must contain a SELECT statement."
         # ── 3. Stacked statements ────────────────────────────────────────────
         # Multiple statements separated by ; are always blocked.
         # Allow a trailing semicolon (common in copy-pasted SQL).
@@ -276,13 +283,28 @@ class MySQLValidator(BaseQueryValidator):
         if _MYSQL_ENCODING_RE.search(sql):
             return False, "Hex literal or CHAR() encoding detected (possible bypass attempt)"
 
-        # ── 10. Subquery exfiltration ────────────────────────────────────────
-        # Nested (SELECT ...) can extract data from arbitrary tables.
-        # Only one top-level SELECT is allowed; subqueries for correlated
-        # queries (e.g. EXISTS) are a grey area — we block them to be safe.
-        subquery_count = len(re.findall(r"\bSELECT\b", sql, re.IGNORECASE))
-        if subquery_count > 1:
-            return False, "Nested SELECT (subquery exfiltration) is not permitted"
+        # ── 10. Subquery exfiltration ────────────────────────────────────────────
+        # Block scalar subqueries in the SELECT list — these can extract data
+        # from arbitrary tables: SELECT (SELECT password FROM users LIMIT 1)
+        # 
+        # Derived tables in FROM are legitimate for aggregation:
+        #   SELECT ... FROM (SELECT ... GROUP BY ...) AS t    ← ALLOW
+        #
+        # The dangerous pattern is SELECT-list subqueries — a ( immediately
+        # after SELECT or a comma in the column list:
+        #   SELECT (SELECT secret FROM ...), name FROM ...    ← BLOCK
+        #
+        # Detect by checking if the first SELECT's column list contains a nested (SELECT.
+        # Simple heuristic: look for the pattern after SELECT and before the first FROM.
+        select_list_match = re.search(
+            r"\bSELECT\b\s+(.*?)\bFROM\b",
+            sql,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if select_list_match:
+            select_list = select_list_match.group(1)
+            if re.search(r"\(\s*SELECT\b", select_list, re.IGNORECASE):
+                return False, "Scalar subquery in SELECT list is not permitted (data exfiltration risk)"
 
         return True, None
 
