@@ -164,8 +164,8 @@ _QUALITY_INSTRUCTIONS: dict[str, str] = {
         "Do NOT include rows beyond position {page_size}.\n"
         "3. End your response with EXACTLY this line and nothing after it "
         "(substitute the numbers, keep the italics and bold):\n"
-        "_Showing {page_size} of {total_rows} total rows. "
-        "Say **show more** to see the next {page_size}._"
+        "Showing {page_size} of {total_rows} total rows. "
+        "Say **show more** to see the next {page_size}."
     ),
 
     # ── User asked for the next page ─────────────────────────────────────────
@@ -174,34 +174,27 @@ _QUALITY_INSTRUCTIONS: dict[str, str] = {
     "pagination": (
         "You are formatting paginated query results.\n\n"
 
-        "FIRST — detect if the user is requesting more results AFTER all rows have already been shown.\n"
-        "If ALL results have already been displayed previously, respond with EXACTLY:\n"
-        "_You have now seen all results of your previous query. How else can I help you?_\n"
-        "Do NOT follow any further structure.\n\n"
-
-        "SECOND — otherwise, format the current page strictly using the rules below.\n\n"
-
         "Determine if this is the last page:\n"
-        "- Last page if {offset_end} >= {total_rows}\n"
+        "- Last page if {raw_offset_end} >= {total_rows}\n"
         "- Otherwise, more rows remain\n\n"
 
         "IMPORTANT EDGE CASE:\n"
         "- The last page may contain fewer rows than the page size\n"
-        "- Even if only a partial set of rows is shown (e.g., 6 of 10), it is STILL the last page if {offset_end} >= {total_rows}\n\n"
+        "- Even if only a partial set of rows is shown (e.g., 6 of 10), it is STILL the last page if {raw_offset_end} >= {total_rows}\n\n"
 
-        "Now structure the response in EXACTLY three parts:\n\n"
+        "Structure the response in EXACTLY three parts:\n\n"
 
         "1. ONE sentence confirming which rows are shown:\n"
         "'Here are rows {offset_start}–{offset_end} of {total_rows}:'\n"
-        "- Do NOT repeat or restate the user’s question\n\n"
+        "- Do NOT repeat or restate the user's question\n\n"
 
         "2. Present the rows as a markdown table\n\n"
 
         "3. Closing line:\n"
-        "- If MORE rows remain ({offset_end} < {total_rows}), end with EXACTLY:\n"
+        "- If MORE rows remain ({raw_offset_end} < {total_rows}), end with EXACTLY:\n"
         "_Showing rows {offset_start}–{offset_end} of {total_rows}. Say **show more** for the next page._\n\n"
 
-        "- If this is the LAST page ({offset_end} >= {total_rows}), end with EXACTLY:\n"
+        "- If this is the LAST page ({raw_offset_end} >= {total_rows}), end with EXACTLY:\n"
         "_You have now seen all {total_rows} results. How else can I help you?_\n\n"
 
         "STRICT RULES:\n"
@@ -222,7 +215,7 @@ _QUALITY_INSTRUCTIONS: dict[str, str] = {
         "Do not repeat the user's question verbatim.\n"
         "2. Present ALL {batch_rows} rows as a markdown table.\n"
         "End with EXACTLY this line and nothing after it:\n"
-        "_You have now seen all {total_rows} results._"
+        "You have now seen all {total_rows} results."
     ),
 
     # ── No rows returned ─────────────────────────────────────────────────────
@@ -424,18 +417,20 @@ class PromptBuilder:
         # reads "rows 11–20", not "rows 11–28".
         raw_instruction = _QUALITY_INSTRUCTIONS.get(quality, _QUALITY_INSTRUCTIONS["small"])
 
-        offset_end = pagination_offset + batch_rows
+        raw_offset_end = pagination_offset + batch_rows
+        offset_end = min(raw_offset_end, true_total) if true_total > 0 else raw_offset_end
 
         if any(
             ph in raw_instruction
-            for ph in ("{total_rows}", "{page_size}", "{offset_start}", "{offset_end}", "{batch_rows}")
+            for ph in ("{total_rows}", "{page_size}", "{offset_start}", "{offset_end}", "{raw_offset_end}", "{batch_rows}")
         ):
             quality_instruction = raw_instruction.format(
                 total_rows=true_total,
                 batch_rows=batch_rows,
                 page_size=page_size,
                 offset_start=pagination_offset + 1,
-                offset_end=offset_end,
+                offset_end=offset_end,           # capped — for display text only
+                raw_offset_end=raw_offset_end,   # uncapped — for last-page comparison
             )
         else:
             quality_instruction = raw_instruction

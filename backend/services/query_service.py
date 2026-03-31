@@ -78,6 +78,54 @@ class QueryResponse:
 
 _SPECIAL_SIGNALS = ("__OUT_OF_SCOPE__", "__PRIVACY_BLOCK__", "__CLARIFY__")
 
+def _extract_friendly_message(signal_text: str) -> str:
+    """
+    Parse the LLM's special signal output into a user-facing message.
+    Handles __OUT_OF_SCOPE__, __PRIVACY_BLOCK__, and __CLARIFY__.
+    """
+    lines = signal_text.splitlines()
+    
+    # Detect signal type from first line
+    first = lines[0].strip() if lines else ""
+    
+    suggest = ""
+    reason = ""
+    ambiguity = ""
+    options: list[str] = []
+    
+    for line in lines[1:]:
+        line = line.strip()
+        if line.startswith("SUGGEST:"):
+            suggest = line[len("SUGGEST:"):].strip()
+        elif line.startswith("REASON:"):
+            reason = line[len("REASON:"):].strip()
+        elif line.startswith("AMBIGUITY:"):
+            ambiguity = line[len("AMBIGUITY:"):].strip()
+        elif line.startswith("- ") and "CLARIFY" in first:
+            options.append(line[2:].strip())
+
+    if "__CLARIFY__" in first:
+        msg = f"I need a bit more clarity to answer that."
+        if ambiguity:
+            msg += f" {ambiguity}"
+        if options:
+            msg += "\n\nDid you mean:\n" + "\n".join(f"- {o}" for o in options)
+        return msg
+
+    if "__PRIVACY_BLOCK__" in first:
+        base = "That information is protected and can't be retrieved."
+        return f"{base} {reason}" if reason else base
+
+    # __OUT_OF_SCOPE__ (default)
+    if suggest:
+        return f"I can't answer that directly. {suggest}"
+    if reason:
+        return f"I can't answer that: {reason}"
+    return (
+        "I couldn't find an answer for that in the database. "
+        "Try asking something specific, like 'What are the top-selling products?' "
+        "or 'What is the total revenue this month?'"
+    )
 
 # ─── Service ──────────────────────────────────────────────────────────────────
 
@@ -171,19 +219,19 @@ class QueryService:
                 f"[PIPELINE] FAILED — MaxRetriesExceeded | "
                 f"total_latency={total_ms}ms | error={e}"
             )
+            # Extract a friendly user-facing message from the signal if present.
+            # The LLM emits: __OUT_OF_SCOPE__\nREASON: ...\nSUGGEST: <message>
+            friendly_answer = _extract_friendly_message(str(e))
             return QueryResponse(
                 question=question,
                 sql="",
                 results=[],
                 row_count=0,
                 strategy_used=self.strategy.strategy_name,
-                answer="",
-                error=(
-                    f"Could not generate a valid query after "
-                    f"{self._settings.MAX_RETRIES} attempts. "
-                    f"Try rephrasing your question. Detail: {e}"
-                ),
+                answer=friendly_answer,
+                error=None,   # Don't surface a raw error — we have a friendly answer
             )
+        
         except Exception as exc:
             total_ms = int((time.perf_counter() - pipeline_start) * 1000)
             logger.error(
@@ -286,6 +334,27 @@ class QueryService:
             f"[TOTAL] batch={batch_row_count} | known_total={known_total_rows} | "
             f"resolved_total={true_total} | is_pagination={is_pagination}"
         )
+
+        # ── 4a. Short-circuit — user asked for more but everything already shown ─
+        # Do this in code, not in the LLM prompt — the LLM has no reliable way
+        # to know pagination state from the prompt alone.
+        if is_pagination and true_total > 0 and pagination_offset >= true_total:
+            logger.info(
+                f"[PIPELINE] All rows already seen | "
+                f"pagination_offset={pagination_offset} >= true_total={true_total}"
+            )
+            return QueryResponse(
+                question=question,
+                sql=strategy_result.query_used,
+                results=[],
+                all_results=[],
+                row_count=0,
+                total_rows=true_total,
+                page_size=self._settings.PAGE_SIZE,
+                strategy_used=strategy_result.strategy_name,
+                answer="You have now seen all results of your previous query. How else can I help you?",
+                error=None,
+            )
 
         # ── 5. Assess result quality ──────────────────────────────────────────
         if show_all and is_pagination:
@@ -447,7 +516,7 @@ class QueryService:
                         error=str(exc),
                     ))
                     continue
-
+                
         # All attempts exhausted
         last_signal = str(last_exc) if last_exc else "unknown error"
         # If the last failure was a special signal, return it as the answer

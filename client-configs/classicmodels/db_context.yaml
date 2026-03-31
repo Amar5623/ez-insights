@@ -40,15 +40,15 @@
 database_name: classicmodels
 database_type: mysql
 
-# ─── Safe Views ───────────────────────────────────────────────────────────────
+# ─── Views ───────────────────────────────────────────────────────────────
 # Use these instead of raw tables when PII is a concern.
-safe_views:
-  safe_customers:
+views:
+  vw_customers:
     replaces: customers
     excludes_columns: [cvv, card_number, card_expiry, upi_id, account_number, ifsc_code, creditLimit]
     use_when: "any customer query that doesn't require payment credential fields"
 
-  safe_payments:
+  vw_payments:
     replaces: payments
     excludes_columns: [checkNumber, upi_id, account_number, ifsc_code, card_number, cvv, card_expiry]
     use_when: "any payment query — always prefer this over raw payments table"
@@ -71,10 +71,10 @@ tables:
       salesRepEmployeeNumber:
         description: "FK to employees.employeeNumber. NULL = no rep assigned. Use IS NULL / IS NOT NULL."
       creditLimit:
-        description: "Approved credit ceiling in USD. Sensitive — excluded from safe_customers view."
+        description: "Approved credit ceiling in USD. Sensitive — excluded from vw_customers view."
       payment_method:
         description: "Primary payment method used by this customer."
-        valid_values: ["UPI", "NEFT", "CHECK"]
+        valid_values: ["UPI", "NEFT", "CHECK", "CARD"]
       country:
         description: "Country of the customer's business."
       state:
@@ -255,12 +255,12 @@ tables:
     description: >
       Customer-level payment records. IMPORTANT: payments are NOT linked to specific
       orders — they are customer-level settlements. Do not JOIN payments to orders.
-      Always use safe_payments view unless specifically instructed otherwise.
+      Always use vw_payments view unless specifically instructed otherwise.
     key_columns:
       customerNumber:
         description: "FK to customers.customerNumber. Part of composite PK."
       checkNumber:
-        description: "Payment reference identifier. Sensitive — excluded from safe_payments view."
+        description: "Payment reference identifier. Sensitive — excluded from vw_payments view."
       paymentDate:
         description: "Date the payment was made."
       amount:
