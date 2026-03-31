@@ -284,18 +284,17 @@ class MySQLValidator(BaseQueryValidator):
             return False, "Hex literal or CHAR() encoding detected (possible bypass attempt)"
 
         # ── 10. Subquery exfiltration ────────────────────────────────────────────
-        # Block scalar subqueries in the SELECT list — these can extract data
-        # from arbitrary tables: SELECT (SELECT password FROM users LIMIT 1)
-        # 
-        # Derived tables in FROM are legitimate for aggregation:
-        #   SELECT ... FROM (SELECT ... GROUP BY ...) AS t    ← ALLOW
+        # Block scalar subqueries in the SELECT list that SELECT column data —
+        # these can extract values from arbitrary tables:
+        #   SELECT (SELECT password FROM users LIMIT 1), name FROM t   ← BLOCK
         #
-        # The dangerous pattern is SELECT-list subqueries — a ( immediately
-        # after SELECT or a comma in the column list:
-        #   SELECT (SELECT secret FROM ...), name FROM ...    ← BLOCK
+        # Safe patterns we must NOT block:
+        #   SELECT x / (SELECT COUNT(*) FROM t) ...                    ← aggregate divisor, safe
+        #   SELECT ... FROM (SELECT ... GROUP BY ...) AS sub            ← derived table in FROM, safe
+        #   SELECT ... WHERE id IN (SELECT id FROM ...)                ← WHERE subquery, safe
         #
-        # Detect by checking if the first SELECT's column list contains a nested (SELECT.
-        # Simple heuristic: look for the pattern after SELECT and before the first FROM.
+        # Strategy: find subqueries inside the SELECT column list only,
+        # then check if they select non-aggregate column data.
         select_list_match = re.search(
             r"\bSELECT\b\s+(.*?)\bFROM\b",
             sql,
@@ -303,8 +302,15 @@ class MySQLValidator(BaseQueryValidator):
         )
         if select_list_match:
             select_list = select_list_match.group(1)
-            if re.search(r"\(\s*SELECT\b", select_list, re.IGNORECASE):
-                return False, "Scalar subquery in SELECT list is not permitted (data exfiltration risk)"
+            # Find all subqueries in the SELECT list
+            for sub_match in re.finditer(r"\(\s*SELECT\b(.*?)\bFROM\b\s*(\w+)", select_list, re.IGNORECASE | re.DOTALL):
+                sub_columns = sub_match.group(1).strip()
+                # Block if the subquery selects actual column data (not just COUNT/SUM/AVG/MIN/MAX)
+                is_aggregate_only = re.match(
+                    r"^\s*(COUNT|SUM|AVG|MIN|MAX)\s*\(", sub_columns, re.IGNORECASE
+                )
+                if not is_aggregate_only:
+                    return False, "Scalar subquery selecting column data in SELECT list is not permitted"
 
         return True, None
 

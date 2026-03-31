@@ -139,7 +139,7 @@ function MarkdownAnswer({ content }: { content: string }) {
 function ThinkingBubble() {
   return (
     <div className="flex gap-3 animate-fade-in">
-      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-primary/20 to-primary/10 ring-2 ring-primary/20">
+      <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-linear-to-br from-primary/20 to-primary/10 ring-2 ring-primary/20">
         <BotIcon className="h-4 w-4 text-primary animate-pulse-subtle" />
       </div>
       <div className="flex items-center gap-1.5 py-3">
@@ -176,7 +176,7 @@ function MessageBubble({
           'flex h-9 w-9 shrink-0 items-center justify-center rounded-xl transition-transform duration-300 hover:scale-105',
           isUser
             ? 'bg-primary shadow-md shadow-primary/25'
-            : 'bg-gradient-to-br from-primary/20 to-primary/10 ring-2 ring-primary/20',
+            : 'bg-linear-to-br from-primary/20 to-primary/10 ring-2 ring-primary/20',
         )}
       >
         {isUser ? (
@@ -217,7 +217,7 @@ function MessageBubble({
               <MarkdownAnswer content={message.content} />
               {isStreaming && (
                 <span
-                  className="inline-block w-[2px] h-[1em] bg-primary align-middle ml-0.5 animate-pulse"
+                  className="inline-block w-0.5 h-[1em] bg-primary align-middle ml-0.5 animate-pulse"
                   aria-hidden="true"
                 />
               )}
@@ -297,7 +297,7 @@ export function ChatMessages({ sidebarOpen }: { sidebarOpen: boolean }) {
     return (
       <div className="flex flex-1 items-center justify-center p-8">
         <div className="max-w-md text-center animate-fade-in-up">
-          <div className="mx-auto mb-6 flex h-20 w-20 items-center justify-center rounded-3xl bg-gradient-to-br from-primary/20 to-primary/5 ring-4 ring-primary/10 shadow-lg shadow-primary/10">
+          <div className="mx-auto mb-6 flex h-20 w-20 items-center justify-center rounded-3xl bg-linear-to-br from-primary/20 to-primary/5 ring-4 ring-primary/10 shadow-lg shadow-primary/10">
             <BotIcon className="h-10 w-10 text-primary" />
           </div>
           <h2 className="mb-3 text-2xl font-semibold text-foreground">
@@ -330,7 +330,7 @@ export function ChatMessages({ sidebarOpen }: { sidebarOpen: boolean }) {
       {/* Compact header shown when sidebar is collapsed */}
       {!sidebarOpen && (
         <div className="flex items-center gap-3 border-b border-border px-6 py-3 bg-background/80 backdrop-blur-sm animate-fade-in">
-          <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-gradient-to-br from-primary/20 to-primary/5 ring-2 ring-primary/10">
+          <div className="flex h-8 w-8 items-center justify-center rounded-xl bg-linear-to-br from-primary/20 to-primary/5 ring-2 ring-primary/10">
             <BotIcon className="h-4 w-4 text-primary" />
           </div>
           <span className="font-semibold text-foreground">Ez-Insights</span>
