@@ -257,6 +257,42 @@ async def run_query(
                 "created_at": now,
             })
             return
+        
+        # ── 3b. CHAT_HISTORY — answer from context, no DB call ───────────────────────
+        if intent == IntentType.CHAT_HISTORY:
+            if context:
+                first_q = context[0].get("question", "").strip()
+                answer = f"Your first question was: \"{first_q}\"" if first_q else "I couldn't find your first question in this session."
+            else:
+                answer = "This appears to be the start of our conversation — no previous questions found."
+
+            words = answer.split(" ")
+            for i, word in enumerate(words):
+                chunk = word if i == 0 else " " + word
+                yield _sse({"chunk": chunk, "done": False})
+                await asyncio.sleep(0.02)
+            yield _sse({
+                "question": question,
+                "sql": "",
+                "results": [],
+                "all_results": [],
+                "row_count": 0,
+                "total_rows": 0,
+                "page_size": page_size,
+                "strategy_used": "chat_history",
+                "error": None,
+                "done": True,
+            })
+            await asyncio.to_thread(append_to_history, {
+                "id": str(uuid.uuid4()),
+                "question": question,
+                "sql": "",
+                "strategy_used": "chat_history",
+                "row_count": 0,
+                "answer": answer,
+                "created_at": now,
+            })
+            return
 
         # ── 4. Ambiguous ──────────────────────────────────────────────────────
         if intent == IntentType.AMBIGUOUS:

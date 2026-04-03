@@ -42,6 +42,7 @@ ANSWER FORMAT CONTRACT (enforced via _QUALITY_INSTRUCTIONS):
 """
 
 import json
+from multiprocessing import context
 from core.interfaces import BaseDBAdapter
 from core.client_config import get_client_config
 from core.logging_config import get_logger, truncate
@@ -364,11 +365,11 @@ class PromptBuilder:
 
         if self.adapter.db_type == "mysql":
             user_content = _SQL_USER_TEMPLATE.format(
-                schema_context=schema_context,
-                conversation_context=conversation_context,
-                attempt_history=history_text,
-                question=question,
-            )
+            schema_context=schema_context,
+            conversation_context=conversation_context,
+            attempt_history=history_text,
+            question=question,
+)
             return {"system": cfg.sql_system_prompt, "user": user_content}
 
         # MongoDB path
@@ -506,23 +507,21 @@ class PromptBuilder:
         return "\n\n".join(lines)
 
     def _format_context_for_sql(self, context: list[dict]) -> str:
-        """
-        Format prior turns for the SQL generation prompt.
-        Includes the question AND the SQL so the LLM understands what it
-        previously queried.
-        """
         if not context:
             return "None"
         lines = []
-        for turn in context[-5:]:  # last 4 turns
+        for turn in context[-5:]:
             q = turn.get("question", "").strip()
             sql = turn.get("sql", "").strip()
+            answer = turn.get("answer", "").strip()
             if q:
                 lines.append(f"User: {q}")
             if sql:
                 lines.append(f"SQL: {sql}")
+            if answer:
+                lines.append(f"Result summary: {answer[:200]}{'...' if len(answer) > 200 else ''}")
         return "\n".join(lines) if lines else "None"
-
+    
     def _format_context_for_answer(self, context: list[dict]) -> str:
         """Format prior turns for the answer generation prompt."""
         if not context:
