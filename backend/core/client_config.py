@@ -50,6 +50,7 @@ logger = get_logger(__name__)
 
 # ─── Data model ───────────────────────────────────────────────────────────────
 
+
 @dataclass
 class ClientConfig:
     """
@@ -77,10 +78,13 @@ class ClientConfig:
     sql_system_prompt: str
     answer_system_prompt: str
 
-    # Static DB context markdown (injected into every SQL user message)
+    # ❗ FIX: moved BEFORE default field
     db_context_markdown: str
 
-    # Structured DB context (parsed from db_context.yaml, for schema indexing)
+    # Optional fields (default AFTER all required fields)
+    mongo_system_prompt: Optional[str] = None
+
+    # Structured DB context
     db_context_structured: dict = field(default_factory=dict)
 
     def get_enriched_schema_chunks(self) -> list[dict]:

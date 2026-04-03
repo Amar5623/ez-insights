@@ -475,51 +475,39 @@ class VectorSearchStrategy(BaseStrategy):
         self, generated_query: Any, top_entity: str
     ) -> dict:
         """
-        MONGO-SPECIFIC: Build the final Mongo query dict, ensuring the
-        "collection" key is always set to the vector-matched entity.
+        MONGO-SPECIFIC: Build the final Mongo query dict safely.
 
-        The vector search result is the authoritative source for the collection
-        name — it is always set from top_entity, even if generated_query also
-        has a "collection" key (the LLM may guess the wrong collection).
+        Improvements:
+            - Only accepts dicts that contain 'filter' or 'pipeline'
+            - Ignores malformed / partial LLM outputs
+            - Always guarantees a valid query for MongoAdapter
+            """
 
-        Priority order:
-          1. If generated_query is a valid dict with a "filter" or "pipeline" key:
-             → use its filter/pipeline, set collection = top_entity
-          2. Otherwise (generated_query is None, a string, or an incomplete dict):
-             → fallback: empty filter on top_entity collection
+        # ✅ STRICT VALIDATION: only accept meaningful dicts
+        if (
+            isinstance(generated_query, dict)
+            and generated_query
+            and ("filter" in generated_query or "pipeline" in generated_query)
+        ):
+            query = {
+                "collection": top_entity  # vector is authoritative
+            }
 
-        NOTE ON PREVIOUS BUG:
-            The old `_FALLBACK_MONGO_TEMPLATE: dict = {}` approach returned an
-            empty dict with no "collection" key. The adapter always crashed.
-            This method always produces a dict with a "collection" key.
-
-        Args:
-            generated_query: LLM output after JSON parsing — may be dict, str,
-                             or None. Only dicts with filter/pipeline are used.
-            top_entity:      Collection name from vector search.
-
-        Returns:
-            A complete query dict ready for adapter.execute_query().
-        """
-        if isinstance(generated_query, dict) and generated_query:
-            query = {}
-            # Vector search is authoritative on collection name
-            query["collection"] = top_entity
-            # Carry over filter or pipeline from the LLM's query
             if "pipeline" in generated_query:
                 query["pipeline"] = generated_query["pipeline"]
-            elif "filter" in generated_query:
-                query["filter"] = generated_query["filter"]
+
             else:
-                # Dict exists but has neither filter nor pipeline — empty filter
-                query["filter"] = {}
-            query["limit"] = generated_query.get("limit", self._settings.MAX_RESULT_ROWS)
+                query["filter"] = generated_query.get("filter", {})
+
+                query["limit"] = generated_query.get(
+                    "limit", self._settings.MAX_RESULT_ROWS
+                )
+
             return query
 
-        # Fallback — empty filter on vector-matched collection
-        # "Give me all documents from the most relevant collection"
+            # ✅ SAFE FALLBACK (guaranteed valid)
         return {
-            "collection": top_entity,
-            "filter": {},
-            "limit": self._settings.MAX_RESULT_ROWS,
-        }
+                "collection": top_entity,
+                "filter": {},
+                "limit": self._settings.MAX_RESULT_ROWS,
+            }

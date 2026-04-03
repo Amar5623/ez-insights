@@ -487,6 +487,16 @@ class QueryService:
                 # No signal — try to parse and execute
                 try:
                     parsed_query = self._parse_query(raw_output)
+
+                    # ── MONGO POST-PROCESSING (ADD ONLY, DO NOT MODIFY EXISTING LOGIC) ──
+                    if self.adapter.db_type == "mongo":
+                        parsed_query = self._apply_mongo_postprocessing(
+                            parsed_query,
+                            is_pagination=is_pagination,
+                            pagination_offset=pagination_offset,
+                            effective_page_size=page_size,
+                            show_all=(page_size == self._settings.MAX_RESULT_ROWS),
+                        )
                     logger.info(f"[PARSED_SQL]\n{parsed_query}")
                     logger.info(f"[PARSED_TYPE] {type(parsed_query)}")
                     t0 = time.perf_counter()
@@ -537,6 +547,42 @@ class QueryService:
             return self._parse_mongo_json(raw_text)
         raise ValueError(f"Unsupported db_type='{db_type}'")
 
+    def _apply_mongo_postprocessing(
+        self,
+        query: dict,
+        is_pagination: bool,
+        pagination_offset: int,
+        effective_page_size: int,
+        show_all: bool,
+    ) -> dict:
+        """
+        Post-process Mongo query AFTER LLM parsing.
+
+        Converts SQL-style pagination → Mongo format:
+            OFFSET → skip
+            LIMIT  → limit
+
+            Also enforces safe defaults.
+            """
+
+            # If not dict, do nothing (safety for SQL path)
+        if not isinstance(query, dict):
+            return query
+
+            # Ensure limit exists
+        if "limit" not in query:
+            query["limit"] = effective_page_size
+
+            # Pagination → apply skip
+            if is_pagination:
+                query["skip"] = pagination_offset
+        
+                # Show all → override limit
+                if show_all:
+                    query["limit"] = self._settings.MAX_RESULT_ROWS
+
+                    return query
+
     @staticmethod
     def _strip_sql(raw: str) -> str:
         sql = raw.strip()
@@ -557,23 +603,44 @@ class QueryService:
         return sql
 
     @staticmethod
-    def _parse_mongo_json(raw: str) -> dict:
+    def _parse_mongo_json(raw: str) -> dict | list:
         text = raw.strip()
-        if text.startswith(""):
-            lines = text.split("\n")
-            text = "\n".join(
-                line for line in lines[1:]
-                if line.strip() not in ("", "json")
-            ).strip()
 
+        # Remove markdown fences like ```json ... ```
+        if text.startswith("```"):
+            lines = text.split("\n")
+            lines = lines[1:]
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+
+        # ── Pipeline array: [ {...}, {...} ] ──────────────────
+        if text.startswith("["):
+            start = text.find("[")
+            end   = text.rfind("]")
+            if start == -1 or end == -1 or end <= start:
+                raise ValueError(
+                    f"LLM output looks like a pipeline but no array found. Got: {repr(text[:200])}"
+                )
+            json_str = text[start:end + 1]
+            try:
+                parsed = json.loads(json_str)
+            except json.JSONDecodeError as exc:
+                raise ValueError(
+                    f"Invalid JSON from LLM: {exc}. Raw: {repr(json_str[:300])}"
+                ) from exc
+            if not isinstance(parsed, list):
+                raise ValueError(f"Expected list pipeline, got {type(parsed).__name__}")
+            return parsed
+
+        # ── Wrapped dict: { "collection": ..., "pipeline": [...] } ──
         start = text.find("{")
-        end = text.rfind("}")
+        end   = text.rfind("}")
         if start == -1 or end == -1 or end <= start:
             raise ValueError(
-                f"LLM output did not contain a JSON object. Got: {repr(text[:200])}"
+                f"LLM output did not contain a JSON object or array. Got: {repr(text[:200])}"
             )
         json_str = text[start:end + 1]
-
         try:
             parsed = json.loads(json_str)
         except json.JSONDecodeError as exc:
@@ -582,13 +649,52 @@ class QueryService:
             ) from exc
 
         if not isinstance(parsed, dict):
-            raise ValueError(f"Expected dict, got {type(parsed)._name_}")
+            raise ValueError(f"Expected dict, got {type(parsed).__name__}")
         if "collection" not in parsed:
             raise ValueError(
                 f"MongoDB query missing 'collection' key. Keys: {list(parsed.keys())}"
             )
-
         return parsed
+
+
+    def _apply_mongo_postprocessing(
+        self,
+        query: dict | list,
+        is_pagination: bool,
+        pagination_offset: int,
+        effective_page_size: int,
+        show_all: bool,
+    ) -> dict:
+        """
+        Post-process Mongo query AFTER LLM parsing.
+
+        If LLM returned a raw pipeline list, wrap it into the standard
+        { collection, pipeline, limit, skip } dict that MongoAdapter expects.
+        """
+
+        # ── Wrap raw pipeline list into adapter dict ──────────
+        if isinstance(query, list):
+            query = {
+                "collection": "orders",   # default; prompt should specify
+                "pipeline": query,
+            }
+
+        if not isinstance(query, dict):
+            return query
+
+        # ── Enforce limit ─────────────────────────────────────
+        if "limit" not in query:
+            query["limit"] = effective_page_size
+
+        # ── Pagination → apply skip ───────────────────────────
+        if is_pagination:
+            query["skip"] = pagination_offset
+
+        # ── Show all → override limit ─────────────────────────
+        if show_all:
+            query["limit"] = self._settings.MAX_RESULT_ROWS
+
+        return query
 
     def _get_previous_question(self, context: list[dict]) -> str:
         """Return the most recent user question from context."""
