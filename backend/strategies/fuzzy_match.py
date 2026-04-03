@@ -698,39 +698,67 @@ class FuzzyMatchStrategy(BaseStrategy):
                 return stage["$match"]
         return {}
 
+    # ONLY showing changed parts (rest remains SAME)
+
     def _extract_mongo_term_and_field(
         self, filter_dict: dict
     ) -> tuple[str | None, str | None]:
-        """
-        MONGO-SPECIFIC: Extract the search term and field name from a plain
-        MongoDB filter dict (NOT the full LLM dict — just the "filter" portion).
 
-        Handles these patterns:
-            {"name": "Tolkein"}                     → ("Tolkein", "name")
-            {"name": {"$regex": "Tolkein"}}         → ("Tolkein", "name")
-            {"name": {"$eq": "Tolkein"}}            → ("Tolkein", "name")
-            {"title": "Foundaton"}                  → ("Foundaton", "title")
+        # handle nested filters (AND/OR queries)
+        for key, value in filter_dict.items():
+            if key in ("$and", "$or") and isinstance(value, list):
+                for sub in value:
+                    term, field = self._extract_mongo_term_and_field(sub)
+                    if term:
+                        return term, field
 
-        Prioritises fields from _TEXT_COLUMN_PRIORITIES.
-        Falls back to the first field with a string value.
-        """
-        # Check priority field names first
-        for priority_field in _TEXT_COLUMN_PRIORITIES:
-            if priority_field in filter_dict:
-                value = filter_dict[priority_field]
-                term = self._extract_string_value(value)
-                if term:
-                    return term, priority_field
+                    # existing logic
+                    for priority_field in _TEXT_COLUMN_PRIORITIES:
+                        if priority_field in filter_dict:
+                            value = filter_dict[priority_field]
+                            term = self._extract_string_value(value)
+                            if term:
+                                return term, priority_field
 
-        # Fallback — first field with a string value
-        for field, value in filter_dict.items():
-            if field.startswith("$"):
-                continue   # skip operators
-            term = self._extract_string_value(value)
-            if term:
-                return term, field
+                            for field, value in filter_dict.items():
+                                if field.startswith("$"):
+                                    continue
+                                term = self._extract_string_value(value)
+                                if term:
+                                    return term, field
 
-        return None, None
+                                return None, None
+
+
+    def _substitute_mongo_term(
+        self, filter_dict: dict, field_name: str, corrected_term: str
+    ) -> dict:
+
+        def replace(obj):
+            if isinstance(obj, dict):
+                new_obj = {}
+                for k, v in obj.items():
+                    if k == field_name:
+                        if isinstance(v, str):
+                            new_obj[k] = corrected_term
+                        elif isinstance(v, dict):
+                            new_val = dict(v)
+                            for op in new_val:
+                                if op in ("$eq", "$regex"):
+                                    new_val[op] = corrected_term
+                                    new_obj[k] = new_val
+                            else:
+                                new_obj[k] = v
+                        else:
+                            new_obj[k] = replace(v)
+                    return new_obj
+
+            elif isinstance(obj, list):
+                return [replace(i) for i in obj]
+
+            return obj
+
+        return replace(filter_dict)
 
     def _extract_string_value(self, value: Any) -> str | None:
         """

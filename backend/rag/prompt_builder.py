@@ -109,6 +109,31 @@ _MONGO_USER_TEMPLATE = """## RAG-Retrieved Schema (inferred from sampled documen
 ## Current Question
 {question}""".strip()
 
+# Add this near the other templates at the top of prompt_builder.py
+
+_MONGO_PAGINATION_PROMPT_TEMPLATE = """## Task
+The user wants to see the next page of results from their previous query.
+
+## Previous Mongo Query (the exact query that was just executed)
+{previous_sql}
+
+## Pagination Parameters
+- Rows per page: {page_size}
+- Rows already shown to the user: {current_offset}
+- Next batch starts at row: {next_offset}
+
+## Your Job
+Return the SAME query with updated "limit" and "skip" values only.
+
+Rules:
+    1. Keep "collection" and "pipeline" (or "filter") identical.
+    2. Set "limit" to {page_size}.
+    3. Set "skip" to {next_offset}.
+    4. Output ONLY raw JSON — no markdown fences, no explanation.
+
+    ## User's message
+    {question}""".strip()
+
 
 # ── Answer generation user message template ───────────────────────────────────
 
@@ -204,6 +229,8 @@ _QUALITY_INSTRUCTIONS: dict[str, str] = {
         "- Follow formatting EXACTLY"
     ),
 
+    
+
     # FIX Bug 2 — user said "show all remaining" ─────────────────────────────
     # All unseen rows are in the prompt at once. The LLM shows them all and
     # closes with a clean "all X results shown" statement.
@@ -288,12 +315,17 @@ class PromptBuilder:
         if is_pagination and context:
             previous_sql = self._get_last_sql(context)
             if previous_sql:
-                user_content = _PAGINATION_PROMPT_TEMPLATE.format(
-                    previous_sql=previous_sql,
-                    page_size=page_size,
-                    current_offset=pagination_offset,
-                    next_offset=pagination_offset,
-                    question=question,
+                if self.adapter.db_type == "mongo":
+                    template = _MONGO_PAGINATION_PROMPT_TEMPLATE
+                else:
+                    template = _PAGINATION_PROMPT_TEMPLATE
+
+                user_content = template.format(
+                        previous_sql=previous_sql,
+                        page_size=page_size,
+                        current_offset=pagination_offset,
+                        next_offset=pagination_offset,
+                        question=question,
                 )
                 logger.info(
                     f"[PROMPT] Built PAGINATION prompt | "

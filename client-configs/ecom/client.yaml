@@ -1,0 +1,15 @@
+assistant_name: "Ecom Analytics Assistant"
+company_name: "Ecom Corp"
+company_short: "Ecom"
+db_name: "ecom_analytics"
+db_type: "mongo"
+
+tone: "professional"
+
+business_description: >
+  Ecom Corp is an online retail platform selling products across categories
+  like electronics, clothing, and home goods. Customers place orders containing
+  multiple items, and revenue is generated from completed transactions.
+
+currency_symbol: "$"
+currency_code: "USD"

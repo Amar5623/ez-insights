@@ -320,10 +320,10 @@ class SQLFilterStrategy(BaseStrategy):
         # ── 1. Type check ────────────────────────────────────────────────────
         if not isinstance(generated_query, dict):
             raise ValueError(
-                f"[MongoDB] SQLFilterStrategy expects a query dict, "
-                f"got {type(generated_query).__name__}. "
-                "Check that query_service._parse_query() correctly parsed "
-                "the LLM JSON output before passing to this strategy."
+                f"[MongoDB] Expected query dict but got {type(generated_query).__name__}.\n"
+                f"Raw query: {repr(generated_query)[:500]}\n"
+                "This usually means the LLM did not return valid JSON or parsing failed "
+                "in QueryService._parse_mongo_json()."
             )
 
         if "collection" not in generated_query:

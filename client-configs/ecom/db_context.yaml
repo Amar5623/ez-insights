@@ -1,0 +1,115 @@
+# ═══════════════════════════════════════════════════════════════
+# MongoDB Context for ecom_analytics (UPGRADED SCHEMA)
+# ═══════════════════════════════════════════════════════════════
+
+database_name: ecom_analytics
+database_type: mongodb
+
+collections:
+
+  users:
+    description: >
+      Customer collection. Each document represents a user.
+
+    key_fields:
+      _id:
+        description: "Unique ObjectId for the customer"
+      name:
+        description: "Customer name"
+      email:
+        description: "Customer email"
+      country:
+        description: "Customer country"
+      created_at:
+        description: "Account creation date"
+
+    common_queries:
+      - "total users"
+      - "users by country"
+      - "new users over time"
+
+  products:
+    description: >
+      Product catalog.
+
+    key_fields:
+      _id:
+        description: "Product ID"
+      name:
+        description: "Product name"
+      category:
+        description: "Product category"
+      price:
+        description: "Selling price"
+      stock:
+        description: "Inventory level"
+
+    common_queries:
+      - "top products"
+      - "products by category"
+      - "low stock products"
+
+  orders:
+    description: >
+      Order collection with embedded items.
+      Each document represents one order.
+
+    key_fields:
+      _id:
+        description: "Order reference ID"
+      user_id:
+        description: "Reference to users._id"
+      order_date:
+        description: "Date of order"
+      status:
+        description: "Order status"
+        valid_values:
+          - "pending"
+          - "confirmed"
+          - "shipped"
+          - "delivered"
+          - "cancelled"
+          - "returned"
+      items:
+        description: "Array of purchased items"
+        structure:
+          product_id: "Reference to products._id"
+          name: "Product name snapshot"
+          quantity: "Units purchased"
+          price: "Price per unit at purchase time"
+      total_amount:
+        description: "Total order value"
+
+    notes: >
+      - Revenue = sum(total_amount)
+      - Items are embedded → use $unwind for product analytics
+
+    common_queries:
+      - "total revenue"
+      - "orders by status"
+      - "sales over time"
+      - "top customers"
+      - "top products"
+
+# ─── Relationships ─────────────────────────────────────────────
+
+relationships: >
+  users._id → orders.user_id
+  products._id → orders.items.product_id
+
+# ─── Computed Metrics ─────────────────────────────────────────
+
+computed_metrics:
+  total_revenue: "SUM(orders.total_amount)"
+  total_orders: "COUNT(orders)"
+  avg_order_value: "AVG(orders.total_amount)"
+  total_items_sold: "SUM(items.quantity)"
+  revenue_by_product: "SUM(items.quantity * items.price)"
+
+# ─── Query Notes ──────────────────────────────────────────────
+
+query_notes: >
+  - Use aggregation pipelines ($match, $group, $project)
+  - Use $unwind on items for product-level queries
+  - Avoid $lookup unless necessary
+  - Prefer embedded items for performance
