@@ -1,0 +1,268 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# client-configs/ecommerce_chatbot/db_context.yaml
+#
+# Rich database context for the ecommerce_chatbot schema.
+# Injected into every SQL generation prompt + used for semantic indexing.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+database_name: ecommerce_chatbot
+database_type: postgres
+
+# ─── Tables ───────────────────────────────────────────────────────────────────
+
+tables:
+
+  customers:
+    description: >
+      B2C customer master. Each row is an individual customer.
+      Contains Indian contact info — phone, email, full address, pincode.
+      customer_id is a hash string (not sequential integer).
+      City and state reflect Indian cities populated via faker data.
+    key_columns:
+      customer_id:
+        description: "Unique hash string. Primary key."
+      customer_city:
+        description: "Indian city e.g. Mumbai, Delhi, Ahmedabad, Bangalore, Pune."
+      customer_state:
+        description: "Indian state e.g. Maharashtra, Gujarat, Karnataka, Delhi."
+      phone:
+        description: "Indian mobile number in format: +91 XXXXXXXXXX."
+      email:
+        description: "Customer email address."
+      full_address:
+        description: "Complete street address e.g. '123, MG Road, Mumbai'."
+      pincode:
+        description: "6-digit Indian postal code."
+    join_notes: >
+      customers → orders (ON customers.customer_id = orders.customer_id)
+    common_queries:
+      - "find customer by email or phone"
+      - "customers by city or state"
+      - "customer order history"
+      - "update customer address"
+
+  orders:
+    description: >
+      Order headers. One row per order. Contains timestamps and status — NOT revenue.
+      Revenue must always be computed from order_items: SUM(price + freight_value).
+      order_delivered_customer_date is NULL until the order is physically delivered.
+      Use this table for delivery tracking, return eligibility, and status checks.
+    key_columns:
+      order_id:
+        description: "Unique hash string. Primary key."
+      customer_id:
+        description: "FK to customers.customer_id."
+      order_status:
+        description: "Current state of the order."
+        valid_values:
+          - "delivered"      # order has been delivered to customer
+          - "shipped"        # order dispatched, in transit
+          - "processing"     # order being prepared
+          - "cancelled"      # order voided
+          - "invoiced"       # invoice raised, awaiting dispatch
+          - "approved"       # order approved, not yet processed
+          - "created"        # order just placed
+          - "unavailable"    # items unavailable
+      order_purchase_timestamp:
+        description: "When the order was placed. Use for trend analysis."
+      order_delivered_customer_date:
+        description: >
+          Actual delivery date. NULL means not yet delivered.
+          CRITICAL for return eligibility: CURRENT_DATE - order_delivered_customer_date::date = days since delivery.
+          Return window = 30 days from this date.
+      order_estimated_delivery_date:
+        description: "Expected delivery date. Compare with CURRENT_DATE to find delayed orders."
+    join_notes: >
+      orders → customers (ON orders.customer_id = customers.customer_id)
+      orders → order_items (ON orders.order_id = order_items.order_id)
+      orders → order_payments (ON orders.order_id = order_payments.order_id)
+      orders → order_reviews (ON orders.order_id = order_reviews.order_id)
+    common_queries:
+      - "order status check by order_id"
+      - "all orders for a customer"
+      - "delayed orders (order_estimated_delivery_date < CURRENT_DATE AND order_status != 'Delivered')"
+      - "return eligibility check (days since delivery vs 30-day policy)"
+      - "orders by status"
+
+  order_items:
+    description: >
+      Order line items. One row per product per order. This is where revenue lives.
+      Revenue = SUM(price + freight_value). price is the product cost, freight_value
+      is the shipping charge for that item. An order can have multiple items.
+    key_columns:
+      order_id:
+        description: "FK to orders.order_id. Part of composite PK."
+      order_item_id:
+        description: "Line item sequence number within the order. Part of composite PK."
+      product_id:
+        description: "FK to products.product_id."
+      seller_id:
+        description: "FK to sellers.seller_id — who fulfilled this item."
+      price:
+        description: "Product sale price in INR (₹). Use for revenue calculations."
+      freight_value:
+        description: "Shipping/delivery charge in INR (₹) for this item."
+    join_notes: >
+      order_items → orders (ON order_items.order_id = orders.order_id)
+      order_items → products (ON order_items.product_id = products.product_id)
+      order_items → sellers (ON order_items.seller_id = sellers.seller_id)
+    common_queries:
+      - "products in a specific order"
+      - "total order value: SUM(price + freight_value)"
+      - "top selling products by order count"
+      - "revenue by seller"
+
+  order_payments:
+    description: >
+      Payment record for each order. One row per order (not per item).
+      payment_value is the total amount paid. Always use this for payment lookups.
+    key_columns:
+      order_id:
+        description: "FK to orders.order_id."
+      payment_type:
+        description: "Payment method used."
+        valid_values:
+          - "Credit Card"
+          - "Debit Card"
+          - "Bank Slip"
+          - "Voucher"
+          - "Not Defined"
+      payment_value:
+        description: "Total amount paid in INR (₹)."
+    join_notes: >
+      order_payments → orders (ON order_payments.order_id = orders.order_id)
+    common_queries:
+      - "payment method breakdown"
+      - "total revenue by payment type"
+      - "payment amount for a specific order"
+
+  order_reviews:
+    description: >
+      Customer reviews and star ratings for orders. One row per order.
+      review_score is 1-5 (5 = best). review_comment_message may be in Portuguese
+      (original Olist dataset) — do not translate, just surface as-is.
+    key_columns:
+      order_id:
+        description: "FK to orders.order_id."
+      review_score:
+        description: "Star rating 1 to 5. 5 = best. Use for satisfaction analysis."
+      review_comment_message:
+        description: "Free-text customer comment. May be NULL or in Portuguese."
+    join_notes: >
+      order_reviews → orders (ON order_reviews.order_id = orders.order_id)
+    common_queries:
+      - "average rating for a product"
+      - "low rated orders (review_score <= 2)"
+      - "review for a specific order"
+      - "overall platform rating: AVG(review_score)"
+
+  products:
+    description: >
+      Product catalogue. One row per product. product_price is the catalogue price
+      (set by faker). Actual sale price is order_items.price — these may differ.
+      product_category_name is in English (translated from Portuguese Olist data).
+      stock_quantity reflects current available units.
+    key_columns:
+      product_id:
+        description: "Unique hash string. Primary key."
+      product_name:
+        description: "Product name with brand e.g. 'Samsung Smart TV 4K', 'Nilkamal Dining Table'."
+      product_category_name:
+        description: "English product category."
+        valid_values:
+          - "electronics"
+          - "computers_accessories"
+          - "furniture_decor"
+          - "bed_bath_table"
+          - "sports_leisure"
+          - "health_beauty"
+          - "housewares"
+          - "toys"
+          - "garden_tools"
+          - "watches_gifts"
+          - "musical_instruments"
+          - "construction_tools_safety"
+          - "perfumery"
+          - "baby"
+          - "General"
+      product_price:
+        description: "Catalogue price in INR (₹). NOT the actual sale price (use order_items.price for that)."
+      product_description:
+        description: "Short product description."
+      stock_quantity:
+        description: "Available units in stock. Use for inventory queries."
+    join_notes: >
+      products → order_items (ON products.product_id = order_items.product_id)
+    common_queries:
+      - "search products by name or category"
+      - "low stock products (stock_quantity < threshold)"
+      - "products in a category"
+      - "top ordered products"
+
+  sellers:
+    description: >
+      Seller/shop master. Each row is an individual seller operating a shop.
+      Indian contact info populated via faker. shop_name is a realistic Indian
+      business name e.g. 'Sri Patel Traders', 'Royal Kumar Enterprises'.
+    key_columns:
+      seller_id:
+        description: "Unique hash string. Primary key."
+      shop_name:
+        description: "Name of the seller's shop."
+      seller_city:
+        description: "Indian city where seller operates."
+      seller_state:
+        description: "Indian state where seller operates."
+      phone:
+        description: "Seller contact number."
+      email:
+        description: "Seller email address."
+      full_address:
+        description: "Seller's shop address."
+      pincode:
+        description: "Seller's 6-digit postal code."
+    join_notes: >
+      sellers → order_items (ON sellers.seller_id = order_items.seller_id)
+    common_queries:
+      - "seller info for a specific order"
+      - "top sellers by revenue"
+      - "sellers by city or state"
+      - "number of orders fulfilled by a seller"
+
+  chat_sessions:
+    description: >
+      Chatbot conversation log. Each row is one turn (user message + bot response).
+      Used for conversation history and memory injection into the agent loop.
+      Do NOT use for business analytics — this is internal chatbot data only.
+    key_columns:
+      session_id:
+        description: "UUID. Primary key. Auto-generated."
+      user_input:
+        description: "What the user asked."
+      bot_response:
+        description: "What the chatbot replied."
+      created_at:
+        description: "Timestamp of the conversation turn."
+    common_queries:
+      - "recent conversation history for a session"
+
+# ─── FK Chain ────────────────────────────────────────────────────────────────
+fk_chain: >
+  customers.customer_id → orders.customer_id
+  orders.order_id → order_items.order_id
+  orders.order_id → order_payments.order_id
+  orders.order_id → order_reviews.order_id
+  order_items.product_id → products.product_id
+  order_items.seller_id → sellers.seller_id
+
+# ─── Common computed expressions ─────────────────────────────────────────────
+computed_expressions:
+  order_revenue: "SUM(oi.price + oi.freight_value)"
+  product_revenue: "SUM(oi.price)"
+  total_shipping: "SUM(oi.freight_value)"
+  avg_order_value: "SUM(oi.price + oi.freight_value) / COUNT(DISTINCT oi.order_id)"
+  days_since_delivery: "CURRENT_DATE - o.order_delivered_customer_date::date"
+  return_eligible: "CURRENT_DATE - o.order_delivered_customer_date::date <= 30"
+  delayed_orders: "o.order_estimated_delivery_date < CURRENT_DATE AND o.order_status NOT IN ('Delivered', 'Cancelled')"
+  avg_rating: "AVG(r.review_score)"
+  low_stock: "p.stock_quantity < 10"

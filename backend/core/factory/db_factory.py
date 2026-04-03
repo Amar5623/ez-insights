@@ -17,7 +17,12 @@ def create_db_adapter() -> BaseDBAdapter:
         from adapters.mongo_adapter import MongoAdapter
         return MongoAdapter()
 
+    if db_type == "postgres":
+        from adapters.postgres_adapter import PostgreSQLAdapter
+        return PostgreSQLAdapter()
+
+
     raise ValueError(
         f"Unknown DB_TYPE='{db_type}'. "
-        "Valid options: mysql | mongo"
+        "Valid options: mysql | mongo | postgres"
     )
