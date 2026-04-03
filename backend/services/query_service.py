@@ -535,6 +535,8 @@ class QueryService:
             return self._strip_sql(raw_text)
         if db_type == "mongo":
             return self._parse_mongo_json(raw_text)
+        if db_type == "postgres":
+            return self._strip_sql(raw_text)
         raise ValueError(f"Unsupported db_type='{db_type}'")
 
     @staticmethod

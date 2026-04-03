@@ -1,0 +1,39 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+# client-configs/ecommerce_chatbot/client.yaml
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Identity ──────────────────────────────────────────────────────────────────
+assistant_name: "ShopBot — E-Commerce Assistant"
+company_name: "ShopBot"
+company_short: "ShopBot"
+db_name: "ecommerce_chatbot"
+db_type: "postgres"
+
+# ── Tone & style ──────────────────────────────────────────────────────────────
+tone: "friendly"
+
+# ── Business description ──────────────────────────────────────────────────────
+business_description: >
+  ShopBot is an Indian B2C e-commerce platform connecting individual customers
+  with sellers across India. Customers place orders for products spanning
+  multiple categories — electronics, furniture, sports, health & beauty, and more.
+  Sellers operate shops from major Indian cities. All transactions are in Indian
+  Rupees (INR). The platform supports Credit Card, Debit Card, Bank Slip,
+  and Voucher payment methods. Orders go through statuses: processing → shipped →
+  delivered, and may be cancelled or marked unavailable.
+
+# ── Currency and locale ───────────────────────────────────────────────────────
+currency_symbol: "₹"
+currency_code: "INR"
+date_format: "DD MMM YYYY"
+number_format: "comma_separated"
+
+# ── Scope guardrails ──────────────────────────────────────────────────────────
+in_scope_description: >
+  Customer orders, product catalogue, seller information, payment records,
+  order reviews and ratings, delivery status, return eligibility checks,
+  stock availability, category-level analysis, city/state-wise analytics.
+
+out_of_scope_description: >
+  Competitor information, raw payment credentials,
+  external market data, data outside this database.

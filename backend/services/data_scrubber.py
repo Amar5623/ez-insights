@@ -53,7 +53,7 @@ _SENSITIVE_COLUMN_NAMES: frozenset[str] = frozenset({
     # Payment
     "upi_id", "account_number", "ifsc_code", "card_number",
     "cvv", "cvv2", "cvc", "card_expiry", "card_expiry_date", "card_pin",
-    "creditlimit", "checknumber",
+    "creditlimit", "checknumber","mobile", "phone", "email",
     # Banking
     "bank_account", "routing_number", "iban", "swift_code",
     # Identity

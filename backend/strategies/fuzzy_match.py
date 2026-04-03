@@ -167,7 +167,7 @@ class FuzzyMatchStrategy(BaseStrategy):
         db = self.adapter.db_type.lower()
 
         # ── MySQL path ────────────────────────────────────────────────────────
-        if db == "mysql":
+        if db in ("mysql", "postgres"):
             return self._execute_mysql(question, generated_query)
 
         # ── MongoDB path ──────────────────────────────────────────────────────

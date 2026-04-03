@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     HF_TOKEN: str = ""   # HuggingFace token for gated model download
 
     # ── Database ─────────────────────────────────────────────────────────────
-    DB_TYPE: str = "mysql"                # mysql | mongo
+    DB_TYPE: str = "mysql"                # mysql | mongo | postgres
 
     MYSQL_HOST: str = "localhost"
     MYSQL_PORT: int = 3306
@@ -67,6 +67,13 @@ class Settings(BaseSettings):
     MONGO_URI: str = "mongodb://localhost:27017"
     MONGO_DATABASE: str = "nlsql_db"
     MONGO_SAMPLE_SIZE: int = 100
+
+    # Add inside the Settings class, after MONGO settings:
+    POSTGRES_HOST: str = "localhost"
+    POSTGRES_PORT: int = 5432
+    POSTGRES_USER: str = "postgres"
+    POSTGRES_PASSWORD: str = ""
+    POSTGRES_DATABASE: str = "ecommerece_chatbot"
 
     # ── Vector store ─────────────────────────────────────────────────────────
     VECTOR_STORE: str = "faiss"           # faiss | pinecone
@@ -153,7 +160,7 @@ class Settings(BaseSettings):
     # Path to the client-specific configuration bundle.
     # Set this to the folder for the current client deployment.
     # Example: CLIENT_CONFIG_PATH=./client-configs/classicmodels
-    CLIENT_CONFIG_PATH: str = "./client-configs/classicmodels"
+    CLIENT_CONFIG_PATH: str = "./client-configs/ecommerce"
  
     RATE_LIMIT_REQUESTS: int = 30   # max requests per window per IP
     RATE_LIMIT_WINDOW_S: int = 60   # window size in seconds
