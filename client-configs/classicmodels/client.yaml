@@ -17,7 +17,7 @@ assistant_name: "ClassicModels Analytics Assistant"
 company_name: "Classic Models"
 company_short: "ClassicModels"             # used in short contexts (logs, badges)
 db_name: "classicmodels"                   # actual MySQL database name
-db_type: "mysql"                           # mysql | mongo (must match DB_TYPE in .env)
+db_type: "mysql"                           # mysql  (must match DB_TYPE in .env)
 
 # ── Tone & style ──────────────────────────────────────────────────────────────
 # Used by the answer system prompt to calibrate response style.

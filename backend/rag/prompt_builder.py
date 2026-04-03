@@ -217,10 +217,10 @@ _QUALITY_INSTRUCTIONS: dict[str, str] = {
 
         "3. Closing line:\n"
         "- If MORE rows remain ({raw_offset_end} < {total_rows}), end with EXACTLY:\n"
-        "_Showing rows {offset_start}–{offset_end} of {total_rows}. Say **show more** for the next page._\n\n"
+        "Showing rows {offset_start}–{offset_end} of {total_rows}. Say **show more** for the next page.\n\n"
 
         "- If this is the LAST page ({raw_offset_end} >= {total_rows}), end with EXACTLY:\n"
-        "_You have now seen all {total_rows} results. How else can I help you?_\n\n"
+        "You have now seen all {total_rows} results. How else can I help you?\n\n"
 
         "STRICT RULES:\n"
         "- Never mix both endings\n"
@@ -514,7 +514,7 @@ class PromptBuilder:
         if not context:
             return "None"
         lines = []
-        for turn in context[-4:]:  # last 4 turns
+        for turn in context[-5:]:  # last 4 turns
             q = turn.get("question", "").strip()
             sql = turn.get("sql", "").strip()
             if q:
@@ -528,7 +528,7 @@ class PromptBuilder:
         if not context:
             return "None"
         lines = []
-        for turn in context[-3:]:  # last 3 turns
+        for turn in context[-4:]:  # last 4 turns
             q = turn.get("question", "").strip()
             a = turn.get("answer", "").strip()
             if q:

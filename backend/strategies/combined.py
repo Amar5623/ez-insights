@@ -31,6 +31,7 @@ Flow:
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from core.interfaces import BaseDBAdapter, BaseStrategy, StrategyResult
@@ -186,8 +187,12 @@ class CombinedStrategy(BaseStrategy):
         """
         try:
             result = strategy.execute(question, generated_query)
+            logging.getLogger(__name__).info(
+            f"[COMBINED] {label} → rows={result.row_count} | query={str(result.query_used)[:100]}"
+        )
             return result, None
         except Exception as exc:
+            logging.getLogger(__name__).error(f"[COMBINED] {label} failed: {exc}")
             return None, f"{label} failed: {exc}"
 
     # ── Merge + deduplication ─────────────────────────────────────────────────

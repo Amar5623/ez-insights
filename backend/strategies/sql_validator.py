@@ -482,9 +482,13 @@ def get_validator(db_type: str) -> BaseQueryValidator:
 
     if db in ("mongo", "mongodb"):
         return MongoValidator()
+    
+    if db in ("postgres", "postgres"):
+        return MySQLValidator()
+    
 
     raise ValueError(
-        f"Unknown db_type='{db_type}'. Valid options: 'mysql' | 'mongo'"
+        f"Unknown db_type='{db_type}'. Valid options: 'mysql' | 'mongo' | 'postgres'"
     )
 
 

@@ -81,7 +81,7 @@ class SQLFilterStrategy(BaseStrategy):
     """
     Executes exact/structured filter queries against MySQL or MongoDB.
 
-    MySQL  — receives a SQL string from the LLM, validates it, extracts
+    MySQL & PostgreSQL — receives a SQL string from the LLM, validates it, extracts
              string/number literals into parameterised placeholders, then
              calls adapter.execute_query(sql, params).
 
@@ -106,7 +106,7 @@ class SQLFilterStrategy(BaseStrategy):
 
         Args:
             question:        Original natural language question (used for metadata).
-            generated_query: SQL string (MySQL) or query dict (MongoDB)
+            generated_query: SQL string (MySQL & PostgreSQL) or query dict (MongoDB)
                              produced by the LLM and parsed by query_service.
 
         Returns:
@@ -119,7 +119,7 @@ class SQLFilterStrategy(BaseStrategy):
         db = self.adapter.db_type.lower()
 
         # ── MySQL path ────────────────────────────────────────────────────────
-        if db == "mysql":
+        if db in ("mysql", "postgres"):
             return self._execute_mysql(question, generated_query)
 
         # ── MongoDB path ──────────────────────────────────────────────────────
@@ -167,7 +167,7 @@ class SQLFilterStrategy(BaseStrategy):
 
     def _execute_mysql(self, question: str, generated_query: Any) -> StrategyResult:
         """
-        MYSQL-SPECIFIC: Validate → clean → parameterize → execute a SQL string.
+        MYSQL & POSTGRESQL -SPECIFIC: Validate → clean → parameterize → execute a SQL string.
 
         Steps:
             1. Type-check: must be a string
@@ -229,7 +229,7 @@ class SQLFilterStrategy(BaseStrategy):
 
     def _parameterize_sql(self, sql: str) -> tuple[str, tuple]:
         """
-        MYSQL-SPECIFIC: Extract string and number literals from a SQL string
+        MYSQL & POSTGRESQL -SPECIFIC: Extract string and number literals from a SQL string
         into parameterised %s placeholders.
 
         This is a safety layer on top of the LLM output — even if the LLM
