@@ -41,6 +41,7 @@ class IntentType(str, Enum):
     PAGINATION = "PAGINATION"  # "show more", "next page"
     GREETING   = "GREETING"
     CHAT       = "CHAT"
+    CHAT_HISTORY = "CHAT_HISTORY" 
     HELP       = "HELP"
     FAREWELL   = "FAREWELL"
     DB_QUERY   = "DB_QUERY"
@@ -192,6 +193,20 @@ DB_PATTERNS = [
     r"\bprice\b", r"\bunder\b", r"\bover\b",
 ]
 
+CHAT_HISTORY_PATTERNS = [
+    r"\bfirst\s+question\b",
+    r"\bfirst\s+message\b",
+    r"\bwhat\s+did\s+i\s+(ask|say)\b",
+    r"\bwhat\s+was\s+my\s+first\b",
+    r"\bwhat\s+have\s+i\s+asked\b",
+    r"\bprevious\s+question\b",
+    r"\blast\s+question\b",
+    r"\bour\s+conversation\b",
+    r"\bconversation\s+history\b",
+    r"\bwhat\s+did\s+we\s+discuss\b",
+    r"\binitial\s+(question|message|query)\b",
+]
+
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -277,6 +292,9 @@ def _rule_based_classification(
             f"prior_sql_turns={sum(1 for t in context if t.get('sql'))}"
         )
         return IntentType.PAGINATION
+    
+    if _match_patterns(text, CHAT_HISTORY_PATTERNS):
+        return IntentType.CHAT_HISTORY
 
     # ── 3. Follow-up to prior DB query ────────────────────────────────────────
     if _is_followup(question, context):
@@ -343,15 +361,14 @@ def _llm_classification(
 
     if context_section:
         prompt = (
-            f"{context_section}\n\n"
-            "Given the conversation above, classify the NEW user query below.\n"
-            "If it is a follow-up, continuation, or variation of the previous "
-            "database question, reply DB.\n"
-            "Reply ONLY with one word:\n"
-            "- DB   (database query or follow-up)\n"
-            "- CHAT (general conversation)\n\n"
-            f"New query: {question}"
-        )
+                    f"{context_section}\n\n"
+                    "Classify the NEW user query below.\n"
+                    "Reply ONLY with one word:\n"
+                    "- DB      (database query or follow-up to a DB result)\n"
+                    "- CHAT    (general conversation)\n"
+                    "- HISTORY (asking about the conversation itself, e.g. 'what was my first question')\n\n"
+                    f"New query: {question}"
+)
     else:
         prompt = (
             "Classify the user query.\n"
@@ -376,6 +393,8 @@ def _llm_classification(
             return IntentType.DB_QUERY
         if normalized == "CHAT":
             return IntentType.CHAT
+        if normalized == "HISTORY":
+            return IntentType.CHAT_HISTORY
         logger.warning(f"[INTENT] Unexpected LLM output: {repr(normalized)} → AMBIGUOUS")
         return IntentType.AMBIGUOUS
     except Exception as exc:

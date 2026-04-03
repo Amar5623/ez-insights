@@ -269,10 +269,14 @@ class QueryService:
         # to any table so FAISS would return random chunks.
         if is_pagination and ctx:
             retrieval_question = self._get_previous_question(ctx)
+            logger.info(...)
+        elif ctx and len(question.split()) <= 8 and self._get_previous_question(ctx):
+            # Short/vague follow-up — use prior question for schema retrieval
+            retrieval_question = self._get_previous_question(ctx)
             logger.info(
-                f"[SCHEMA_RAG] Pagination — using previous question for retrieval | "
-                f"retrieval_question={truncate(retrieval_question, 80)}"
-            )
+            f"[SCHEMA_RAG] Vague follow-up — using previous question for retrieval | "
+            f"retrieval_question={truncate(retrieval_question, 80)}"
+    )
         else:
             retrieval_question = question
 
